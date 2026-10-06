@@ -493,6 +493,41 @@ class EnergyAnalyticsOptimizer:
         if e_month == 0.0 and 'totalPower' in df_month.columns and len(df_month) > 1:
             e_month = float(df_month['totalPower'].mean() * (len(df_month) * 10.0 / 3600.0) / 1000.0)
 
+        # Hourly load curves for Room 1 and Room 2 (24 hours)
+        hourly_r1 = [0.0] * 24
+        hourly_r2 = [0.0] * 24
+        if 'timestamp' in df.columns:
+            df['hour_idx'] = df['timestamp'].dt.hour
+            for h in range(24):
+                h_df = df[df['hour_idx'] == h]
+                if len(h_df) > 0:
+                    hourly_r1[h] = round(float(h_df['power1'].mean()), 1)
+                    hourly_r2[h] = round(float(h_df['power2'].mean()), 1)
+
+        # 7-day daily bars for current week
+        day_names = ['M', 'T', 'W', 'T', 'F', 'S', 'S']
+        daily_bars = []
+        for i in range(7):
+            b_date = (w_start + timedelta(days=i)).date()
+            b_df = df[df['timestamp'].dt.date == b_date] if 'timestamp' in df.columns else pd.DataFrame()
+            b_units = self._compute_delta_reset_safe(b_df, 'totalEnergy')
+            if b_units == 0.0 and 'totalPower' in b_df.columns and len(b_df) > 1:
+                b_units = float(b_df['totalPower'].mean() * (len(b_df) * 10.0 / 3600.0) / 1000.0)
+            daily_bars.append({
+                "dayIndex": i,
+                "dayName": day_names[i],
+                "date": b_date.strftime("%Y-%m-%d"),
+                "units": round(b_units, 3)
+            })
+
+        # Room-wise monthly energy split
+        r1_month_e = self._compute_delta_reset_safe(df_month, 'energy1')
+        if r1_month_e == 0.0 and 'power1' in df_month.columns and len(df_month) > 1:
+            r1_month_e = float(df_month['power1'].mean() * (len(df_month) * 10.0 / 3600.0) / 1000.0)
+        r2_month_e = self._compute_delta_reset_safe(df_month, 'energy2')
+        if r2_month_e == 0.0 and 'power2' in df_month.columns and len(df_month) > 1:
+            r2_month_e = float(df_month['power2'].mean() * (len(df_month) * 10.0 / 3600.0) / 1000.0)
+
         # Baseline projection
         elapsed_days = max(1, now.day)
         days_in_month = 30
@@ -503,13 +538,30 @@ class EnergyAnalyticsOptimizer:
         return {
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "dailyKwh": round(e_day, 3),
+            "todayUnits": round(e_day, 3),
             "dailyCost": round(e_day * self.cost_per_kwh, 2),
             "weeklyKwh": round(e_week, 3),
+            "weekUnits": round(e_week, 3),
+            "weeklyTotalUnits": round(e_week, 3),
             "weeklyCost": round(e_week * self.cost_per_kwh, 2),
             "monthlyKwh": round(e_month, 3),
+            "monthToDateUnits": round(e_month, 3),
             "monthlyCost": round(e_month * self.cost_per_kwh, 2),
             "projectedMonthlyKwh": projected_monthly_kwh,
-            "projectedMonthlyCost": projected_cost
+            "projectedMonthEndUnits": projected_monthly_kwh,
+            "projectedMonthlyCost": projected_cost,
+            "averageDailyUnits": round(daily_avg, 3),
+            "allocatedUnits": 96.0,
+            "remainingUnits": round(max(0.0, 96.0 - e_month), 3),
+            "projectedExcessUnits": round(max(0.0, projected_monthly_kwh - 96.0), 3),
+            "usagePercentage": round(e_month / 96.0, 4),
+            "daysElapsed": elapsed_days,
+            "daysInMonth": days_in_month,
+            "dailyBars": daily_bars,
+            "hourlyLoadRoom1": hourly_r1,
+            "hourlyLoadRoom2": hourly_r2,
+            "room1MonthUnits": round(r1_month_e, 3),
+            "room2MonthUnits": round(r2_month_e, 3)
         }
 
     def generate_optimization_advisories(self, predictions_dict, analytics_dict):
@@ -537,12 +589,57 @@ class EnergyAnalyticsOptimizer:
         savings_kwh = max(0.0, current_proj - target_monthly_kwh)
         savings_cost = round(savings_kwh * self.cost_per_kwh, 2)
 
+        r1_units = analytics_dict.get('room1MonthUnits', 0.0) if analytics_dict else 0.0
+        r2_units = analytics_dict.get('room2MonthUnits', 0.0) if analytics_dict else 0.0
+        tot_units = r1_units + r2_units
+        r1_pct = round((r1_units / tot_units) * 100.0, 1) if tot_units > 0 else 50.0
+        r2_pct = round((r2_units / tot_units) * 100.0, 1) if tot_units > 0 else 50.0
+
+        suggestions = []
+        if r1_units >= r2_units:
+            suggestions.append({
+                "title": "Room 1 is the primary energy contributor",
+                "subtitle": "Inspect Room 1 incandescent lighting/appliances (40W+) during active hours.",
+                "icon": "warning"
+            })
+        else:
+            suggestions.append({
+                "title": "Room 2 is the primary energy contributor",
+                "subtitle": "Inspect Room 2 lighting/appliances (10W+) during active hours.",
+                "icon": "warning"
+            })
+            
+        if summary.get('overallNextHourState') == 'HIGH USAGE':
+            suggestions.append({
+                "title": "Shift flexible loads away from next hour",
+                "subtitle": "High usage predicted next hour. Defer non-essential equipment.",
+                "icon": "access_time"
+            })
+        else:
+            suggestions.append({
+                "title": "Optimal load profile active",
+                "subtitle": "All rooms operating within normal limits.",
+                "icon": "bolt"
+            })
+            
+        suggestions.append({
+            "title": "Stay within Gruha Jyothi quota",
+            "subtitle": f"Target daily average under {round(96.0 / 30.0, 1)} units/day.",
+            "icon": "energy_savings_leaf"
+        })
+
         return {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "targetMonthlyKwh": target_monthly_kwh,
             "potentialSavingsKwh": round(savings_kwh, 2),
+            "estimatedSavingsUnits": round(savings_kwh, 2),
             "potentialSavingsCost": savings_cost,
             "recommendedActions": optimizations,
+            "suggestions": suggestions,
+            "room1Units": r1_units,
+            "room2Units": r2_units,
+            "room1Percent": r1_pct,
+            "room2Percent": r2_pct,
             "peakAlert": summary.get('overallNextHourState') == 'HIGH USAGE'
         }
 
@@ -557,24 +654,30 @@ class EnergyAnalyticsOptimizer:
             notifications.append({
                 "id": f"notif_{int(time.time())}_r1",
                 "title": "Room 1 Peak Load Warning",
+                "subtitle": "Room 1 load is predicted to exceed 40W in the next hour.",
                 "message": "Room 1 load is predicted to exceed 40W in the next hour.",
-                "type": "WARNING",
+                "type": "prediction",
+                "priority": "HIGH",
                 "timestamp": now_str
             })
         if r2_st == "HIGH USAGE":
             notifications.append({
                 "id": f"notif_{int(time.time())}_r2",
                 "title": "Room 2 Peak Load Warning",
+                "subtitle": "Room 2 load is predicted to exceed 10W in the next hour.",
                 "message": "Room 2 load is predicted to exceed 10W in the next hour.",
-                "type": "WARNING",
+                "type": "prediction",
+                "priority": "HIGH",
                 "timestamp": now_str
             })
         if not notifications:
             notifications.append({
                 "id": f"notif_{int(time.time())}_ok",
                 "title": "Energy Usage Optimal",
+                "subtitle": "All rooms are operating within normal baseline limits.",
                 "message": "All rooms are operating within normal baseline limits.",
-                "type": "INFO",
+                "type": "optimal",
+                "priority": "LOW",
                 "timestamp": now_str
             })
         return {
@@ -620,33 +723,34 @@ class VoltixProductionBridge:
             df = df.dropna(subset=['timestamp']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
         return df
 
-    def sync_once(self):
-        print("=" * 80)
-        print(" VOLTIX PRODUCTION FIREBASE ML BRIDGE (ENHANCED RF)")
-        print("=" * 80)
-        
+    def sync_once(self, force=True):
         df = self.fetch_readings(limit=400)
         if df is None or len(df) == 0:
-            print("[!] No readings retrieved from Firebase.")
-            return False
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [!] No readings retrieved from Firebase.")
+            return False, None
             
-        print(f"[*] Retrieved {len(df)} readings from telemetry stream.")
-        
         if len(df) < MIN_HISTORY_REQUIRED:
-            print(f"[!] Insufficient historical data for Enhanced RF prediction. Found: {len(df)}, Required: {MIN_HISTORY_REQUIRED}")
-            return False
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [!] Insufficient historical data for Enhanced RF prediction. Found: {len(df)}, Required: {MIN_HISTORY_REQUIRED}")
+            return False, None
             
         latest_reading = df.iloc[-1].to_dict()
-        
+        latest_ts = str(latest_reading.get('timestamp', ''))
+
+        # Avoid duplicate prediction & write cycles if telemetry is unchanged
+        if not force and hasattr(self, '_last_synced_ts') and self._last_synced_ts == latest_ts:
+            return False, latest_ts
+
         # ML Inference
         preds = self.engine.predict(latest_reading, df)
         analytics_res = self.analytics.compute_historical_analytics(df)
         opt_res = self.analytics.generate_optimization_advisories(preds, analytics_res)
         notif_res = self.analytics.generate_notifications(preds, analytics_res)
         
-        print(f"[*] Predictions Generated for Timestamp: {preds['timestamp']}")
-        print(f"  Room 1 Next Hour: {preds['room1']['nextHour']['state']} ({preds['room1']['nextHour']['confidencePercent']}%)")
-        print(f"  Room 2 Next Hour: {preds['room2']['nextHour']['state']} ({preds['room2']['nextHour']['confidencePercent']}%)")
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n[{now_str}] [*] Telemetry Updated (Timestamp: {preds['timestamp']}, Window: {len(df)} readings)")
+        print(f"  Room 1 (Measured: {preds['room1']['currentPower']}W -> Predicted: {preds['room1']['predictedPower']}W) | Next Hour: {preds['room1']['nextHour']['state']} ({preds['room1']['nextHour']['confidencePercent']}%) | Tomorrow: {preds['room1']['tomorrow']['state']}")
+        print(f"  Room 2 (Measured: {preds['room2']['currentPower']}W -> Predicted: {preds['room2']['predictedPower']}W) | Next Hour: {preds['room2']['nextHour']['state']} ({preds['room2']['nextHour']['confidencePercent']}%) | Tomorrow: {preds['room2']['tomorrow']['state']}")
+        print(f"  Total Load: {preds['summary']['totalCurrentPower']}W -> Predicted: {preds['summary']['totalPredictedPower']}W | Overall: {preds['summary']['overallNextHourState']}")
         
         # Publish to Firebase
         if not self.mock_data_path:
@@ -654,19 +758,58 @@ class VoltixProductionBridge:
             if analytics_res: self.fb.put(ANALYTICS_PATH, analytics_res)
             if opt_res: self.fb.put(OPTIMIZATION_PATH, opt_res)
             if notif_res: self.fb.put(NOTIFICATIONS_PATH, notif_res)
-            print("[+] Successfully synced predictions, analytics, optimization & notifications to Firebase!")
+            print("  [+] Successfully synced predictions, analytics, optimization & notifications to Firebase!")
             
-        return True
+        self._last_synced_ts = latest_ts
+        return True, latest_ts
+
+    def run_loop(self, poll_interval=10, max_cycles=None):
+        """
+        Continuous live inference loop.
+        Monitors telemetry every `poll_interval` seconds, generates 126 causal features,
+        and pushes predictions to Firebase in real time.
+        """
+        print("=" * 80)
+        print(" VOLTIX PRODUCTION FIREBASE ML BRIDGE — CONTINUOUS INFERENCE LOOP")
+        print(f" Telemetry Stream: {READINGS_PATH}")
+        print(f" Poll Interval: {poll_interval}s | Minimum History: {MIN_HISTORY_REQUIRED} readings")
+        print(" Press Ctrl+C to stop.")
+        print("=" * 80)
+
+        cycles = 0
+        try:
+            while True:
+                synced, latest_ts = self.sync_once(force=(cycles == 0))
+                if not synced and latest_ts is not None:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [*] Telemetry unchanged ({latest_ts}). Waiting for next ESP32 update...", end='\r')
+                
+                cycles += 1
+                if max_cycles is not None and cycles >= max_cycles:
+                    print(f"\n[*] Completed requested {max_cycles} cycle(s).")
+                    break
+
+                time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            print("\n[!] VOLTIX ML Bridge loop terminated gracefully by user (Ctrl+C).")
 
 def main():
     parser = argparse.ArgumentParser(description="VOLTIX Production ML Bridge")
     parser.add_argument("--once", action="store_true", help="Run a single cycle")
+    parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds (default: 10)")
+    parser.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles to run before exiting (for testing)")
     parser.add_argument("--mock", action="store_true", help="Use local realistic dataset as mock stream")
     args = parser.parse_args()
     
     mock_file = os.path.join(BASE_DIR, "VOLTIX_realistic_30day_synthetic_dataset.csv") if args.mock else None
     bridge = VoltixProductionBridge(mock_data_path=mock_file)
-    bridge.sync_once()
+    
+    if args.once:
+        print("=" * 80)
+        print(" VOLTIX PRODUCTION FIREBASE ML BRIDGE (SINGLE CYCLE)")
+        print("=" * 80)
+        bridge.sync_once(force=True)
+    else:
+        bridge.run_loop(poll_interval=args.interval, max_cycles=args.max_cycles)
 
 if __name__ == '__main__':
     main()
