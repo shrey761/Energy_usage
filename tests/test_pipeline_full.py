@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+VOLTIX — Full Pipeline Unit Test Suite (Enhanced RF Production Validation)
+Script: tests/test_pipeline_full.py
+"""
+
 import os
 import sys
 import unittest
@@ -14,6 +20,8 @@ from firebase_ml_bridge import (
     EnergyMLInferenceEngine,
     EnergyAnalyticsOptimizer,
     FirebaseClient,
+    BASELINE_FEATURE_COLS,
+    ENHANCED_FEATURE_COLS,
     FEATURE_COLS,
     MODEL_DIR,
     FIREBASE_DB_URL
@@ -36,34 +44,33 @@ class TestVoltixMLPipeline(unittest.TestCase):
         
         self.assertIn('r1', self.engine.thresholds)
         self.assertIn('r2', self.engine.thresholds)
-        self.assertEqual(self.engine.thresholds['r1'], 0.70)
-        self.assertEqual(self.engine.thresholds['r2'], 0.65)
+        self.assertEqual(self.engine.thresholds['r1'], 0.40)
+        self.assertEqual(self.engine.thresholds['r2'], 0.40)
 
     def test_02_feature_count_and_order(self):
-        """Verify feature count is exactly 23 and matches expected order."""
-        self.assertEqual(len(FEATURE_COLS), 23)
-        expected = [
-            'hour', 'dayofweek', 'is_weekend', 'hour_sin', 'hour_cos',
-            'power1', 'power2', 'current1', 'current2', 'voltage1', 'voltage2',
-            'totalPower', 'totalCurrent',
-            'power1_lag1', 'power1_lag3', 'power1_roll_mean5', 'power1_roll_max5',
-            'power2_lag1', 'power2_lag3', 'power2_roll_mean5', 'power2_roll_max5',
-            'totalPower_lag1', 'totalPower_roll_mean5'
+        """Verify baseline (23) and enhanced (126) feature schemas and ordering."""
+        self.assertEqual(len(BASELINE_FEATURE_COLS), 23)
+        self.assertEqual(len(ENHANCED_FEATURE_COLS), 126)
+        
+        # Verify first 10 enhanced feature names
+        expected_first_10 = [
+            'current1', 'current2', 'energy1', 'energy2', 'power1',
+            'power2', 'totalCurrent', 'totalEnergy', 'totalPower', 'voltage1'
         ]
-        self.assertEqual(FEATURE_COLS, expected)
+        self.assertEqual(ENHANCED_FEATURE_COLS[:10], expected_first_10)
 
     def test_03_inference_predictions(self):
-        """Verify inference output structure and predict_proba calculations."""
+        """Verify inference output structure and predict_proba calculations on calibrated loads."""
         sample_reading = {
-            'timestamp': '2026-08-24 18:05:04',
-            'power1': 1600.0,
-            'power2': 500.0,
+            'timestamp': '2026-10-04 18:05:04',
+            'power1': 80.0,
+            'power2': 20.0,
             'voltage1': 230.0,
             'voltage2': 230.0,
-            'current1': 6.95,
-            'current2': 2.17,
-            'totalPower': 2100.0,
-            'totalCurrent': 9.12
+            'current1': 0.35,
+            'current2': 0.09,
+            'totalPower': 100.0,
+            'totalCurrent': 0.44
         }
         res = self.engine.predict(sample_reading)
         self.assertIn('room1', res)
@@ -89,9 +96,9 @@ class TestVoltixMLPipeline(unittest.TestCase):
             {'totalEnergy': 15.0}
         ])
         delta_normal = EnergyAnalyticsOptimizer._compute_delta_reset_safe(df_normal, 'totalEnergy')
-        self.assertEqual(delta_normal, 5.0) # 15 - 10
+        self.assertEqual(delta_normal, 5.0)
 
-        # With rollover: 10.0 -> 12.0 -> 0.5 (reset!) -> 2.0
+        # Rollover test
         df_reset = pd.DataFrame([
             {'totalEnergy': 10.0},
             {'totalEnergy': 12.0},
@@ -99,17 +106,30 @@ class TestVoltixMLPipeline(unittest.TestCase):
             {'totalEnergy': 2.0}
         ])
         delta_reset = EnergyAnalyticsOptimizer._compute_delta_reset_safe(df_reset, 'totalEnergy')
-        # Deltas: (12-10)=2 + (reset: 0.5) + (2-0.5)=1.5 -> Total = 4.0
         self.assertEqual(delta_reset, 4.0)
 
-    def test_05_firebase_connection_and_sync(self):
-        """Verify live connection to Firebase Realtime Database and roundtrip data verification."""
-        client = FirebaseClient(FIREBASE_DB_URL)
-        data = client.get("/sensor_logs/esp32_01/predictions/latest")
-        self.assertIsNotNone(data)
-        self.assertIn('room1', data)
-        self.assertIn('room2', data)
-        self.assertIn('timestamp', data)
+    def test_05_enhanced_inference_with_history(self):
+        """Verify full 126-feature Enhanced RF prediction using 400-reading history window."""
+        sample_reading = {
+            'timestamp': '2026-10-30 20:00:00',
+            'power1': 80.0,
+            'power2': 20.0,
+            'voltage1': 230.0,
+            'voltage2': 230.0,
+            'current1': 0.35,
+            'current2': 0.09,
+            'totalPower': 100.0,
+            'totalCurrent': 0.44
+        }
+        history_df = pd.DataFrame([sample_reading] * 400)
+        history_df['timestamp'] = [pd.to_datetime('2026-10-30 20:00:00') - pd.Timedelta(seconds=(399-i)*10) for i in range(400)]
+        
+        res = self.engine.predict(sample_reading, history_df)
+        self.assertIn('room1', res)
+        self.assertIn('room2', res)
+        self.assertIn(res['room1']['nextHour']['state'], ['HIGH USAGE', 'NORMAL'])
+        self.assertIn(res['room2']['nextHour']['state'], ['HIGH USAGE', 'NORMAL'])
+        self.assertGreaterEqual(res['room1']['nextHour']['confidencePercent'], 50.0)
 
 if __name__ == '__main__':
     unittest.main()

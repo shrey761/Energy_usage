@@ -1,7 +1,14 @@
+#!/usr/bin/env python3
+"""
+VOLTIX — Production Firebase ML Bridge (Enhanced Random Forest Integration)
+Script: firebase_ml_bridge.py
+"""
+
 import os
 import sys
-import timecd 
+import time
 import json
+import argparse
 import urllib.request
 import urllib.error
 import numpy as np
@@ -12,6 +19,7 @@ import joblib
 # Paths setup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "saved_models")
+SCHEMA_PATH = os.path.join(MODEL_DIR, "enhanced_features.json")
 
 FIREBASE_DB_URL = "https://voltix-1bac0-default-rtdb.asia-southeast1.firebasedatabase.app"
 READINGS_PATH = "/sensor_logs/esp32_01/readings"
@@ -21,8 +29,8 @@ OPTIMIZATION_PATH = "/sensor_logs/esp32_01/optimization/latest"
 NOTIFICATIONS_PATH = "/sensor_logs/esp32_01/notifications/latest"
 ALERTS_PATH = "/sensor_logs/esp32_01/alerts/latest"
 
-# Exact 23 features in exact training order from energy_advisor.py
-FEATURE_COLS = [
+# 23 Baseline Features (for tomorrow and regression models)
+BASELINE_FEATURE_COLS = [
     'hour', 'dayofweek', 'is_weekend', 'hour_sin', 'hour_cos',
     'power1', 'power2', 'current1', 'current2', 'voltage1', 'voltage2',
     'totalPower', 'totalCurrent',
@@ -31,8 +39,25 @@ FEATURE_COLS = [
     'totalPower_lag1', 'totalPower_roll_mean5'
 ]
 
+FEATURE_COLS = BASELINE_FEATURE_COLS  # Backwards compatibility
+
+def load_enhanced_feature_schema():
+    if os.path.exists(SCHEMA_PATH):
+        try:
+            with open(SCHEMA_PATH, 'r') as f:
+                return json.load(f)['features']
+        except Exception:
+            pass
+    return []
+
+ENHANCED_FEATURE_COLS = load_enhanced_feature_schema()
+MIN_HISTORY_REQUIRED = 360  # 360 readings @ 10s = 1 hour
+
+THRESHOLD_R1 = 40.0
+THRESHOLD_R2 = 10.0
+
 # -------------------------------------------------------------------------
-# 1. FIREBASE SECURE CLIENT (REST + Optional Admin SDK support)
+# 1. FIREBASE SECURE CLIENT
 # -------------------------------------------------------------------------
 class FirebaseClient:
     def __init__(self, db_url=FIREBASE_DB_URL):
@@ -62,9 +87,7 @@ class FirebaseClient:
         for attempt in range(retries):
             try:
                 data_bytes = json.dumps(payload).encode('utf-8') if payload is not None else None
-                req = urllib.request.Request(url, data=data_bytes, method=method)
-                if payload is not None:
-                    req.add_header('Content-Type', 'application/json')
+                req = urllib.request.Request(url, data=data_bytes, method=method, headers={'Content-Type': 'application/json'})
                 
                 with urllib.request.urlopen(req, timeout=15) as response:
                     res_body = response.read().decode('utf-8')
@@ -84,7 +107,6 @@ class FirebaseClient:
 
     def patch(self, path, payload):
         return self._rest_request(path, method='PATCH', payload=payload)
-
 
 # -------------------------------------------------------------------------
 # 2. AI ML INFERENCE & ADVISORY ENGINE
@@ -117,23 +139,15 @@ class EnergyMLInferenceEngine:
                     return json.load(f)
             except Exception:
                 pass
-        return {'r1': 0.70, 'r2': 0.65}
+        return {'r1': 0.40, 'r2': 0.40}
 
-    def prepare_features(self, latest_reading, history_df=None):
-        """
-        Constructs the exact 23-feature vector matching the training pipeline in energy_advisor.py.
-        Zero future leakage: only past and current values at time t are used.
-        """
+    def prepare_baseline_features(self, latest_reading, history_df=None):
         ts = latest_reading.get('timestamp', None)
         if isinstance(ts, str):
-            try:
-                dt = pd.to_datetime(ts)
-            except Exception:
-                dt = datetime.now()
-        elif isinstance(ts, (datetime, pd.Timestamp)):
-            dt = ts
-        else:
-            dt = datetime.now()
+            try: dt = pd.to_datetime(ts)
+            except Exception: dt = datetime.now()
+        elif isinstance(ts, (datetime, pd.Timestamp)): dt = ts
+        else: dt = datetime.now()
 
         hour = int(latest_reading.get('hour', dt.hour))
         dayofweek = int(latest_reading.get('dayofweek', dt.weekday()))
@@ -148,14 +162,7 @@ class EnergyMLInferenceEngine:
         tp = float(latest_reading.get('totalPower', p1 + p2))
         tc = float(latest_reading.get('totalCurrent', c1 + c2))
 
-        # Lags & rolling windows:
-        # In training (energy_advisor.py lines 82-85):
-        # - lag1 was shift(1) -> value at t-1 (iloc[-2] in chronological sequence ending with latest_reading)
-        # - lag3 was shift(3) -> value at t-3 (iloc[-4] in chronological sequence)
-        # - roll_mean5 was rolling(5, min_periods=1).mean() -> mean of [t-4, t-3, t-2, t-1, t] (iloc[-5:])
-        # - roll_max5 was rolling(5, min_periods=1).max() -> max of [t-4, t-3, t-2, t-1, t] (iloc[-5:])
         if history_df is not None and len(history_df) >= 1:
-            # Ensure history_df ends with latest_reading
             hist = history_df.sort_values('timestamp').reset_index(drop=True)
             p1_lag1 = float(hist['power1'].iloc[-2] if len(hist) >= 2 else p1)
             p1_lag3 = float(hist['power1'].iloc[-4] if len(hist) >= 4 else p1)
@@ -208,36 +215,174 @@ class EnergyMLInferenceEngine:
             'totalPower_lag1': tp_lag1,
             'totalPower_roll_mean5': tp_mean5
         }
-        return pd.DataFrame([row_dict])[FEATURE_COLS], dt, p1, p2, tp
+        return pd.DataFrame([row_dict])[BASELINE_FEATURE_COLS], dt, p1, p2, tp
+
+    def prepare_enhanced_features(self, history_df):
+        """
+        Constructs the exact 126-feature vector from historical telemetry.
+        """
+        if history_df is None or len(history_df) < MIN_HISTORY_REQUIRED:
+            avail = len(history_df) if history_df is not None else 0
+            raise ValueError(f"Insufficient historical data for Enhanced RF prediction. Required: {MIN_HISTORY_REQUIRED}, Available: {avail}")
+            
+        df = history_df.copy()
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.sort_values('timestamp').reset_index(drop=True)
+        else:
+            raise ValueError("Missing 'timestamp' column in history DataFrame.")
+            
+        required_cols = ['current1', 'current2', 'energy1', 'energy2', 'power1', 'power2',
+                         'totalCurrent', 'totalEnergy', 'totalPower', 'voltage1', 'voltage2']
+        for c in required_cols:
+            if c not in df.columns:
+                if c in ['energy1', 'energy2', 'totalEnergy']:
+                    df[c] = 0.0
+                else:
+                    raise ValueError(f"Missing required telemetry field: '{c}'")
+                
+        latest_ts = df['timestamp'].iloc[-1]
+        df['hour'] = df['timestamp'].dt.hour
+        df['minute'] = df['timestamp'].dt.minute
+        df['day_of_week'] = df['timestamp'].dt.dayofweek
+        df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+        df['month'] = df['timestamp'].dt.month
+        
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24.0)
+        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24.0)
+        df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7.0)
+        df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7.0)
+        
+        df['power_ratio'] = df['power1'] / (df['totalPower'] + 1e-6)
+        df['apparent_power_1'] = df['voltage1'] * df['current1']
+        df['apparent_power_2'] = df['voltage2'] * df['current2']
+        
+        new_cols = {}
+        lags = [1, 3, 6, 30, 60, 180, 360]
+        for col in ['power1', 'power2', 'totalPower']:
+            for lag in lags:
+                new_cols[f'{col}_lag{lag}'] = df[col].shift(lag)
+                
+        windows = {'1m': 6, '5m': 30, '15m': 90, '30m': 180, '1h': 360}
+        for col in ['power1', 'power2', 'totalPower']:
+            for w_name, w_size in windows.items():
+                roll = df[col].rolling(window=w_size, min_periods=1)
+                new_cols[f'{col}_roll_mean{w_name}'] = roll.mean()
+                new_cols[f'{col}_roll_min{w_name}'] = roll.min()
+                new_cols[f'{col}_roll_max{w_name}'] = roll.max()
+                new_cols[f'{col}_roll_std{w_name}'] = roll.std().fillna(0.0)
+                
+        for col in ['power1', 'power2', 'totalPower']:
+            new_cols[f'{col}_diff_1m'] = df[col] - df[col].shift(6)
+            new_cols[f'{col}_diff_5m'] = df[col] - df[col].shift(30)
+            new_cols[f'{col}_diff_15m'] = df[col] - df[col].shift(90)
+            new_cols[f'{col}_diff_1h'] = df[col] - df[col].shift(360)
+            
+        def compute_durations(power_series, threshold):
+            is_on = (power_series >= threshold).astype(int).values
+            n = len(is_on)
+            consec_on = np.zeros(n)
+            consec_off = np.zeros(n)
+            since_trans = np.zeros(n)
+            
+            cur_on = 0
+            cur_off = 0
+            cur_trans = 0
+            for i in range(n):
+                if is_on[i] == 1:
+                    cur_on += 1
+                    cur_off = 0
+                else:
+                    cur_off += 1
+                    cur_on = 0
+                
+                if i > 0 and is_on[i] != is_on[i-1]:
+                    cur_trans = 0
+                else:
+                    cur_trans += 1
+                    
+                consec_on[i] = cur_on * (10.0 / 60.0)
+                consec_off[i] = cur_off * (10.0 / 60.0)
+                since_trans[i] = cur_trans * (10.0 / 60.0)
+                
+            return is_on, consec_on, consec_off, since_trans
+
+        r1_on_state, r1_on, r1_off, r1_trans = compute_durations(df['power1'], THRESHOLD_R1)
+        new_cols['r1_is_on'] = r1_on_state
+        new_cols['r1_consec_on_min'] = r1_on
+        new_cols['r1_consec_off_min'] = r1_off
+        new_cols['r1_min_since_trans'] = r1_trans
+        
+        r2_on_state, r2_on, r2_off, r2_trans = compute_durations(df['power2'], THRESHOLD_R2)
+        new_cols['r2_is_on'] = r2_on_state
+        new_cols['r2_consec_on_min'] = r2_on
+        new_cols['r2_consec_off_min'] = r2_off
+        new_cols['r2_min_since_trans'] = r2_trans
+        
+        new_df = pd.DataFrame(new_cols, index=df.index)
+        df = pd.concat([df, new_df], axis=1)
+        
+        df['date'] = df['timestamp'].dt.date
+        today_date = latest_ts.date()
+        today_mask = (df['date'] == today_date)
+        
+        df['r1_daily_cum_on_min'] = 0.0
+        df.loc[today_mask, 'r1_daily_cum_on_min'] = ((df.loc[today_mask, 'power1'] >= THRESHOLD_R1).astype(float) * (10.0 / 60.0)).cumsum()
+        
+        df['r2_daily_cum_on_min'] = 0.0
+        df.loc[today_mask, 'r2_daily_cum_on_min'] = ((df.loc[today_mask, 'power2'] >= THRESHOLD_R2).astype(float) * (10.0 / 60.0)).cumsum()
+        
+        latest_row = df.iloc[-1:]
+        
+        if len(ENHANCED_FEATURE_COLS) > 0:
+            generated = [c for c in ENHANCED_FEATURE_COLS if c in latest_row.columns]
+            if len(generated) != 126 or generated != ENHANCED_FEATURE_COLS:
+                raise ValueError(f"Feature schema mismatch! Expected 126 features. Found {len(generated)}")
+            X_enh = latest_row[ENHANCED_FEATURE_COLS]
+        else:
+            X_enh = latest_row
+            
+        return X_enh, latest_ts, float(latest_row['power1'].values[0]), float(latest_row['power2'].values[0])
 
     def predict(self, latest_reading, history_df=None):
-        X, dt, p1, p2, tp = self.prepare_features(latest_reading, history_df)
+        X_base, dt, p1, p2, tp = self.prepare_baseline_features(latest_reading, history_df)
+        
+        # Determine Enhanced features vector
+        if history_df is not None and len(history_df) >= MIN_HISTORY_REQUIRED:
+            X_enh, _, _, _ = self.prepare_enhanced_features(history_df)
+        else:
+            # Steady-state baseline fallback for isolated single reading invocation
+            fallback_hist = pd.DataFrame([latest_reading] * MIN_HISTORY_REQUIRED)
+            fallback_hist['timestamp'] = [datetime.now() - pd.Timedelta(seconds=(MIN_HISTORY_REQUIRED-1-i)*10) for i in range(MIN_HISTORY_REQUIRED)]
+            X_enh, _, _, _ = self.prepare_enhanced_features(fallback_hist)
 
-        # 1. Room 1 Predictions
-        r1_next_probas = self.models['r1_next_hour'].predict_proba(X)[0]
+        # 1. Room 1 Predictions (Enhanced RF for 1-Hour)
+        r1_next_probas = self.models['r1_next_hour'].predict_proba(X_enh)[0]
         r1_next_state = "HIGH USAGE" if r1_next_probas[1] >= 0.5 else "NORMAL"
         r1_next_conf = float(r1_next_probas[1 if r1_next_state == "HIGH USAGE" else 0])
 
-        th_r1 = self.thresholds.get('r1', 0.70)
-        r1_tmrw_probas = self.models['r1_tomorrow'].predict_proba(X)[0]
+        # 1. Room 1 Tomorrow (Baseline RF for 24-Hour)
+        th_r1 = self.thresholds.get('r1', 0.40)
+        r1_tmrw_probas = self.models['r1_tomorrow'].predict_proba(X_base)[0]
         r1_tmrw_state = "HIGH USAGE" if r1_tmrw_probas[1] >= th_r1 else "NORMAL"
         r1_tmrw_conf = float(r1_tmrw_probas[1 if r1_tmrw_state == "HIGH USAGE" else 0])
 
-        r1_pred_power = max(0.0, float(self.models['r1_reg_next'].predict(X)[0]))
+        r1_pred_power = max(0.0, float(self.models['r1_reg_next'].predict(X_base)[0]))
 
-        # 2. Room 2 Predictions
-        r2_next_probas = self.models['r2_next_hour'].predict_proba(X)[0]
+        # 2. Room 2 Predictions (Enhanced RF for 1-Hour)
+        r2_next_probas = self.models['r2_next_hour'].predict_proba(X_enh)[0]
         r2_next_state = "HIGH USAGE" if r2_next_probas[1] >= 0.5 else "NORMAL"
         r2_next_conf = float(r2_next_probas[1 if r2_next_state == "HIGH USAGE" else 0])
 
-        th_r2 = self.thresholds.get('r2', 0.65)
-        r2_tmrw_probas = self.models['r2_tomorrow'].predict_proba(X)[0]
+        # 2. Room 2 Tomorrow (Baseline RF for 24-Hour)
+        th_r2 = self.thresholds.get('r2', 0.40)
+        r2_tmrw_probas = self.models['r2_tomorrow'].predict_proba(X_base)[0]
         r2_tmrw_state = "HIGH USAGE" if r2_tmrw_probas[1] >= th_r2 else "NORMAL"
         r2_tmrw_conf = float(r2_tmrw_probas[1 if r2_tmrw_state == "HIGH USAGE" else 0])
 
-        r2_pred_power = max(0.0, float(self.models['r2_reg_next'].predict(X)[0]))
+        r2_pred_power = max(0.0, float(self.models['r2_reg_next'].predict(X_base)[0]))
 
-        # Explainable Contextual Recommendations
+        # Recommendations
         r1_recs = []
         if r1_next_state == "HIGH USAGE":
             r1_recs.append("Reduce non-essential loads in Room 1 during the next hour.")
@@ -293,417 +438,223 @@ class EnergyMLInferenceEngine:
             }
         }
 
-
 # -------------------------------------------------------------------------
-# 3. ENERGY AGGREGATOR, STATISTICAL MONTHLY FORECAST & OPTIMIZATION
+# 3. ENERGY ANALYTICS & OPTIMIZATION MODULE
 # -------------------------------------------------------------------------
 class EnergyAnalyticsOptimizer:
-    GRUHA_JYOTHI_TARGET = 96.0
+    def __init__(self, cost_per_kwh=8.0):
+        self.cost_per_kwh = cost_per_kwh
 
     @staticmethod
-    def _compute_delta_reset_safe(df_subset, col_name, current_val=None):
-        """
-        Safely computes cumulative energy consumption across time windows,
-        detecting meter rollover/resets so consumption is never negative.
-        Formula: Sum of non-negative consecutive diffs.
-        """
-        if df_subset.empty:
-            return max(0.0, float(current_val)) if current_val is not None else 0.0
-        
-        vals = df_subset[col_name].values
-        total_delta = 0.0
-        for i in range(1, len(vals)):
-            diff = vals[i] - vals[i-1]
-            if diff >= 0:
-                total_delta += diff
-            else:
-                # Meter reset/rollover detected: accumulate reading after reset
-                total_delta += vals[i]
-        
-        if current_val is not None and len(vals) > 0:
-            diff_last = current_val - vals[-1]
-            if diff_last >= 0:
-                total_delta += diff_last
-            else:
-                total_delta += current_val
+    def _compute_delta_reset_safe(df, col):
+        if col not in df.columns or len(df) == 0:
+            return 0.0
+        vals = pd.to_numeric(df[col], errors='coerce').fillna(0.0).values
+        if len(vals) < 2:
+            return 0.0
+        diffs = np.diff(vals)
+        pos_diffs = np.where(diffs >= 0, diffs, vals[1:])
+        return float(np.sum(pos_diffs))
 
-        return max(0.0, total_delta)
+    def compute_historical_analytics(self, readings_df):
+        if readings_df is None or len(readings_df) == 0:
+            return None
 
-    @staticmethod
-    def process_readings_history(df_hist, latest_reading):
-        """
-        Processes chronological historical dataframe and computes accurate deltas,
-        statistical month-end projections, and optimization recommendations.
-        """
-        ref_time = latest_reading.get('timestamp')
-        if not isinstance(ref_time, datetime):
-            try:
-                ref_time = pd.to_datetime(ref_time)
-            except Exception:
-                ref_time = datetime.now()
-
-        current_total_energy = float(latest_reading.get('totalEnergy', 0.0))
-        current_e1 = float(latest_reading.get('energy1', 0.0))
-        current_e2 = float(latest_reading.get('energy2', 0.0))
-
-        # 1. Today's consumption (reset-safe delta)
-        start_of_today = ref_time.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_df = df_hist[df_hist['timestamp'] >= start_of_today] if not df_hist.empty else pd.DataFrame()
-        today_units = EnergyAnalyticsOptimizer._compute_delta_reset_safe(today_df, 'totalEnergy', current_total_energy)
-        today_r1 = EnergyAnalyticsOptimizer._compute_delta_reset_safe(today_df, 'energy1', current_e1)
-        today_r2 = EnergyAnalyticsOptimizer._compute_delta_reset_safe(today_df, 'energy2', current_e2)
-
-        # 2. This week's consumption (reset-safe delta starting Monday)
-        start_of_week = (ref_time - timedelta(days=ref_time.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        week_df = df_hist[df_hist['timestamp'] >= start_of_week] if not df_hist.empty else pd.DataFrame()
-        week_units = EnergyAnalyticsOptimizer._compute_delta_reset_safe(week_df, 'totalEnergy', current_total_energy)
-
-        # 3. This month's consumption (reset-safe delta starting 1st of month)
-        start_of_month = ref_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        month_df = df_hist[df_hist['timestamp'] >= start_of_month] if not df_hist.empty else pd.DataFrame()
-        month_to_date_units = EnergyAnalyticsOptimizer._compute_delta_reset_safe(month_df, 'totalEnergy', current_total_energy)
-        month_r1 = EnergyAnalyticsOptimizer._compute_delta_reset_safe(month_df, 'energy1', current_e1)
-        month_r2 = EnergyAnalyticsOptimizer._compute_delta_reset_safe(month_df, 'energy2', current_e2)
-
-        # If data history is strictly in-session, fall back to max available delta
-        if month_to_date_units == 0.0 and not df_hist.empty:
-            month_to_date_units = EnergyAnalyticsOptimizer._compute_delta_reset_safe(df_hist, 'totalEnergy', current_total_energy)
-            month_r1 = EnergyAnalyticsOptimizer._compute_delta_reset_safe(df_hist, 'energy1', current_e1)
-            month_r2 = EnergyAnalyticsOptimizer._compute_delta_reset_safe(df_hist, 'energy2', current_e2)
-
-        # 4. Statistical Month-End Projection (Extrapolation: Average Daily * Days in Month)
-        elapsed_days = max(1, ref_time.day)
-        if ref_time.month in [1, 3, 5, 7, 8, 10, 12]:
-            days_in_month = 31
-        elif ref_time.month in [4, 6, 9, 11]:
-            days_in_month = 30
+        df = readings_df.copy()
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            now = df['timestamp'].iloc[-1]
         else:
-            days_in_month = 29 if (ref_time.year % 4 == 0 and (ref_time.year % 100 != 0 or ref_time.year % 400 == 0)) else 28
+            now = datetime.now()
 
-        avg_daily = month_to_date_units / elapsed_days
-        projected_month_end = avg_daily * days_in_month
-        remaining_units = max(0.0, EnergyAnalyticsOptimizer.GRUHA_JYOTHI_TARGET - month_to_date_units)
-        projected_excess = max(0.0, projected_month_end - EnergyAnalyticsOptimizer.GRUHA_JYOTHI_TARGET)
+        # Day, week, month windows
+        d_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        w_start = d_start - timedelta(days=now.weekday())
+        m_start = d_start.replace(day=1)
 
-        # 5. Weekly 7-Day Bar Data (Reset-safe calculation per day)
-        daily_bars = []
-        for i in range(7):
-            d = (start_of_week + timedelta(days=i)).date()
-            d_df = df_hist[df_hist['timestamp'].dt.date == d] if not df_hist.empty else pd.DataFrame()
-            d_val = EnergyAnalyticsOptimizer._compute_delta_reset_safe(d_df, 'totalEnergy') if not d_df.empty else 0.0
-            daily_bars.append({
-                "dayIndex": i,
-                "dayName": ["M", "T", "W", "T", "F", "S", "S"][i],
-                "date": str(d),
-                "units": round(d_val, 2)
-            })
+        df_day = df[df['timestamp'] >= d_start] if 'timestamp' in df.columns else df
+        df_week = df[df['timestamp'] >= w_start] if 'timestamp' in df.columns else df
+        df_month = df[df['timestamp'] >= m_start] if 'timestamp' in df.columns else df
 
-        # 6. Hourly Historical Load Profiles (0-23 hours measured averages in Watts)
-        hourly_r1 = [0.0] * 24
-        hourly_r2 = [0.0] * 24
-        if not df_hist.empty:
-            df_hist_copy = df_hist.copy()
-            df_hist_copy['hour'] = df_hist_copy['timestamp'].dt.hour
-            h_grp = df_hist_copy.groupby('hour')[['power1', 'power2']].mean()
-            for h in range(24):
-                if h in h_grp.index:
-                    hourly_r1[h] = round(float(h_grp.loc[h, 'power1']), 1)
-                    hourly_r2[h] = round(float(h_grp.loc[h, 'power2']), 1)
+        e_day = self._compute_delta_reset_safe(df_day, 'totalEnergy')
+        e_week = self._compute_delta_reset_safe(df_week, 'totalEnergy')
+        e_month = self._compute_delta_reset_safe(df_month, 'totalEnergy')
 
-        # 7. Optimization Breakdown & Explainable Actions
-        total_room_units = max(0.001, month_r1 + month_r2)
-        r1_pct = (month_r1 / total_room_units) * 100.0
-        r2_pct = (month_r2 / total_room_units) * 100.0
+        if e_day == 0.0 and 'totalPower' in df_day.columns and len(df_day) > 1:
+            e_day = float(df_day['totalPower'].mean() * (len(df_day) * 10.0 / 3600.0) / 1000.0)
+        if e_week == 0.0 and 'totalPower' in df_week.columns and len(df_week) > 1:
+            e_week = float(df_week['totalPower'].mean() * (len(df_week) * 10.0 / 3600.0) / 1000.0)
+        if e_month == 0.0 and 'totalPower' in df_month.columns and len(df_month) > 1:
+            e_month = float(df_month['totalPower'].mean() * (len(df_month) * 10.0 / 3600.0) / 1000.0)
 
-        suggestions = []
-        if month_r1 > month_r2:
-            suggestions.append({
-                "title": "Room 1 is the primary energy contributor",
-                "subtitle": f"Room 1 accounts for {r1_pct:.0f}% of measured room consumption. Inspect high-power appliances.",
-                "icon": "warning"
-            })
-        elif month_r2 > month_r1:
-            suggestions.append({
-                "title": "Room 2 is the primary energy contributor",
-                "subtitle": f"Room 2 accounts for {r2_pct:.0f}% of measured room consumption. Inspect high-power appliances.",
-                "icon": "warning"
-            })
-        else:
-            suggestions.append({
-                "title": "Balanced Room Usage",
-                "subtitle": "Room 1 and Room 2 show balanced energy consumption.",
-                "icon": "bolt"
-            })
-
-        if projected_excess > 0:
-            suggestions.append({
-                "title": "Gruha Jyothi Limit Alert",
-                "subtitle": f"Projected monthly consumption ({projected_month_end:.1f} Units) exceeds the 96-unit allocation by {projected_excess:.1f} Units.",
-                "icon": "energy_savings_leaf"
-            })
-        else:
-            suggestions.append({
-                "title": "Within Free Electricity Quota",
-                "subtitle": f"Current consumption trend is projected at {projected_month_end:.1f} Units, well within the 96-unit quota.",
-                "icon": "bolt"
-            })
-
-        suggestions.append({
-            "title": "Shift flexible loads to off-peak hours",
-            "subtitle": "Running high-wattage equipment during non-peak hours reduces grid stress and optimizes efficiency.",
-            "icon": "access_time"
-        })
+        # Baseline projection
+        elapsed_days = max(1, now.day)
+        days_in_month = 30
+        daily_avg = e_month / elapsed_days if e_month > 0 else (e_day if e_day > 0 else 0.5)
+        projected_monthly_kwh = round(daily_avg * days_in_month, 2)
+        projected_cost = round(projected_monthly_kwh * self.cost_per_kwh, 2)
 
         return {
-            "forecast": {
-                "monthToDateUnits": round(month_to_date_units, 2),
-                "todayUnits": round(today_units, 2),
-                "weekUnits": round(week_units, 2),
-                "averageDailyUnits": round(avg_daily, 2),
-                "projectedMonthEndUnits": round(projected_month_end, 2),
-                "allocatedUnits": EnergyAnalyticsOptimizer.GRUHA_JYOTHI_TARGET,
-                "remainingUnits": round(remaining_units, 2),
-                "projectedExcessUnits": round(projected_excess, 2),
-                "usagePercentage": round(min(1.0, month_to_date_units / EnergyAnalyticsOptimizer.GRUHA_JYOTHI_TARGET), 4),
-                "daysElapsed": elapsed_days,
-                "daysInMonth": days_in_month
-            },
-            "analytics": {
-                "weeklyTotalUnits": round(week_units, 2),
-                "dailyBars": daily_bars,
-                "hourlyLoadRoom1": hourly_r1,
-                "hourlyLoadRoom2": hourly_r2,
-                "room1MonthUnits": round(month_r1, 2),
-                "room2MonthUnits": round(month_r2, 2)
-            },
-            "optimization": {
-                "room1Units": round(month_r1, 2),
-                "room2Units": round(month_r2, 2),
-                "room1Percent": round(r1_pct, 1),
-                "room2Percent": round(r2_pct, 1),
-                "suggestions": suggestions
-            }
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "dailyKwh": round(e_day, 3),
+            "dailyCost": round(e_day * self.cost_per_kwh, 2),
+            "weeklyKwh": round(e_week, 3),
+            "weeklyCost": round(e_week * self.cost_per_kwh, 2),
+            "monthlyKwh": round(e_month, 3),
+            "monthlyCost": round(e_month * self.cost_per_kwh, 2),
+            "projectedMonthlyKwh": projected_monthly_kwh,
+            "projectedMonthlyCost": projected_cost
         }
 
-    @staticmethod
-    def generate_notifications(prediction_result, forecast_data, latest_reading, history_df=None):
-        """
-        Generates dynamic rule-based notifications from actual system states and predictions.
-        """
+    def generate_optimization_advisories(self, predictions_dict, analytics_dict):
+        if not predictions_dict:
+            return None
+
+        r1 = predictions_dict.get('room1', {})
+        r2 = predictions_dict.get('room2', {})
+        summary = predictions_dict.get('summary', {})
+
+        active_loads = []
+        if r1.get('nextHour', {}).get('state') == 'HIGH USAGE':
+            active_loads.append("Room 1 Lighting/Appliances (40W+)")
+        if r2.get('nextHour', {}).get('state') == 'HIGH USAGE':
+            active_loads.append("Room 2 Lighting/Appliances (10W+)")
+
+        optimizations = []
+        if active_loads:
+            optimizations.append(f"Shift flexible loads away from next hour: {', '.join(active_loads)}")
+        else:
+            optimizations.append("Current load profile is optimal. No action needed.")
+
+        target_monthly_kwh = 25.0
+        current_proj = analytics_dict.get('projectedMonthlyKwh', 0.0) if analytics_dict else 0.0
+        savings_kwh = max(0.0, current_proj - target_monthly_kwh)
+        savings_cost = round(savings_kwh * self.cost_per_kwh, 2)
+
+        return {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "targetMonthlyKwh": target_monthly_kwh,
+            "potentialSavingsKwh": round(savings_kwh, 2),
+            "potentialSavingsCost": savings_cost,
+            "recommendedActions": optimizations,
+            "peakAlert": summary.get('overallNextHourState') == 'HIGH USAGE'
+        }
+
+    def generate_notifications(self, predictions_dict, analytics_dict):
         notifications = []
-        p_res = prediction_result
-        fc = forecast_data["forecast"]
-        opt = forecast_data["optimization"]
-        total_p = float(latest_reading.get('totalPower', 0.0))
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Alert 1: Projected monthly usage exceeds 96 units
-        if fc["projectedExcessUnits"] > 0:
+        r1_st = predictions_dict.get('room1', {}).get('nextHour', {}).get('state')
+        r2_st = predictions_dict.get('room2', {}).get('nextHour', {}).get('state')
+
+        if r1_st == "HIGH USAGE":
             notifications.append({
-                "id": "notif_projected_exceed",
-                "type": "warning",
-                "title": "Projected Quota Exceed",
-                "subtitle": f"Statistical month-end projection is {fc['projectedMonthEndUnits']:.1f} Units (exceeds 96-unit Gruha Jyothi quota by {fc['projectedExcessUnits']:.1f} Units).",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "priority": "HIGH"
+                "id": f"notif_{int(time.time())}_r1",
+                "title": "Room 1 Peak Load Warning",
+                "message": "Room 1 load is predicted to exceed 40W in the next hour.",
+                "type": "WARNING",
+                "timestamp": now_str
             })
-
-        # Alert 2: Approaching allocated limit (>= 85%)
-        if fc["usagePercentage"] >= 0.85 and fc["remainingUnits"] > 0:
+        if r2_st == "HIGH USAGE":
             notifications.append({
-                "id": "notif_approaching_limit",
-                "type": "warning",
-                "title": "Approaching Allocation Limit",
-                "subtitle": f"You have consumed {fc['monthToDateUnits']:.1f} of {fc['allocatedUnits']:.0f} allocated units. Only {fc['remainingUnits']:.1f} units remaining.",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "priority": "HIGH"
+                "id": f"notif_{int(time.time())}_r2",
+                "title": "Room 2 Peak Load Warning",
+                "message": "Room 2 load is predicted to exceed 10W in the next hour.",
+                "type": "WARNING",
+                "timestamp": now_str
             })
-
-        # Alert 3: Unusually high instantaneous power (statistically derived: >2500W or >95th percentile)
-        high_power_threshold = 2500.0
-        if history_df is not None and len(history_df) >= 20:
-            p95 = float(history_df['totalPower'].quantile(0.95))
-            high_power_threshold = max(2000.0, p95)
-
-        if total_p >= high_power_threshold:
+        if not notifications:
             notifications.append({
-                "id": "notif_instant_high_power",
-                "type": "warning",
-                "title": "High Instantaneous Load Detected",
-                "subtitle": f"Current total power ({total_p:.0f} W) exceeds the {high_power_threshold:.0f} W high-load threshold.",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "priority": "HIGH"
+                "id": f"notif_{int(time.time())}_ok",
+                "title": "Energy Usage Optimal",
+                "message": "All rooms are operating within normal baseline limits.",
+                "type": "INFO",
+                "timestamp": now_str
             })
-
-        # Alert 4: Room 1 Next Hour High Usage Prediction
-        if p_res["room1"]["nextHour"]["state"] == "HIGH USAGE":
-            notifications.append({
-                "id": "notif_r1_next_high",
-                "type": "prediction",
-                "title": "High Usage Expected in Room 1",
-                "subtitle": f"AI model predicts high power load next hour ({p_res['room1']['nextHour']['confidencePercent']:.0f}% confidence). Reduce non-essential loads.",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "priority": "MEDIUM"
-            })
-
-        # Alert 5: Room 2 Next Hour High Usage Prediction
-        if p_res["room2"]["nextHour"]["state"] == "HIGH USAGE":
-            notifications.append({
-                "id": "notif_r2_next_high",
-                "type": "prediction",
-                "title": "High Usage Expected in Room 2",
-                "subtitle": f"AI model predicts high power load next hour ({p_res['room2']['nextHour']['confidencePercent']:.0f}% confidence). Reduce non-essential loads.",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "priority": "MEDIUM"
-            })
-
-        # Alert 6: Room 1 Tomorrow Advance Warning
-        if p_res["room1"]["tomorrow"]["state"] == "HIGH USAGE":
-            notifications.append({
-                "id": "notif_r1_tomorrow_high",
-                "type": "advance",
-                "title": "Advance Alert: High Usage Tomorrow (Room 1)",
-                "subtitle": f"High energy consumption predicted in Room 1 tomorrow around this time ({p_res['room1']['tomorrow']['confidencePercent']:.0f}% confidence). Plan ahead to shift heavy appliances.",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "priority": "MEDIUM"
-            })
-
-        # Alert 7: Room 2 Tomorrow Advance Warning
-        if p_res["room2"]["tomorrow"]["state"] == "HIGH USAGE":
-            notifications.append({
-                "id": "notif_r2_tomorrow_high",
-                "type": "advance",
-                "title": "Advance Alert: High Usage Tomorrow (Room 2)",
-                "subtitle": f"High energy consumption predicted in Room 2 tomorrow around this time ({p_res['room2']['tomorrow']['confidencePercent']:.0f}% confidence). Plan ahead to shift heavy appliances.",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "priority": "MEDIUM"
-            })
-
-        return notifications
-
+        return {
+            "timestamp": now_str,
+            "items": notifications
+        }
 
 # -------------------------------------------------------------------------
-# 4. MAIN BRIDGE WORKER
+# 4. BRIDGE RUNNER
 # -------------------------------------------------------------------------
-class FirebaseMLBridge:
-    def __init__(self):
-        self.firebase = FirebaseClient(FIREBASE_DB_URL)
-        self.ml_engine = EnergyMLInferenceEngine(MODEL_DIR)
-        print("[*] Initialized Firebase ML Bridge successfully.")
-        print(f"[*] Firebase Target URL: {FIREBASE_DB_URL}")
+class VoltixProductionBridge:
+    def __init__(self, mock_data_path=None):
+        self.fb = FirebaseClient(FIREBASE_DB_URL)
+        self.engine = EnergyMLInferenceEngine(MODEL_DIR)
+        self.analytics = EnergyAnalyticsOptimizer()
+        self.mock_data_path = mock_data_path
 
-    def run_sync(self):
-        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Fetching telemetry records from Firebase...")
+    def fetch_readings(self, limit=400):
+        if self.mock_data_path:
+            if os.path.exists(self.mock_data_path):
+                df = pd.read_csv(self.mock_data_path)
+                return df.tail(limit).reset_index(drop=True)
+            return None
+        data = self.fb.get(READINGS_PATH, f'orderBy="timestamp"&limitToLast={limit}')
+        if not data:
+            return None
+        if isinstance(data, dict):
+            records = list(data.values())
+        elif isinstance(data, list):
+            records = [r for r in data if r is not None]
+        else:
+            return None
+        df = pd.DataFrame(records)
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
+        return df
+
+    def sync_once(self):
+        print("=" * 80)
+        print(" VOLTIX PRODUCTION FIREBASE ML BRIDGE (ENHANCED RF)")
+        print("=" * 80)
         
-        # Retrieve recent historical window (up to 1500 records) to support analytics and lag construction
-        readings_data = self.firebase.get(READINGS_PATH, query_params='orderBy=%22$key%22&limitToLast=1500')
-
-        if not readings_data or not isinstance(readings_data, dict):
-            print("[!] No readings retrieved from Firebase. Waiting for ESP32...")
+        df = self.fetch_readings(limit=400)
+        if df is None or len(df) == 0:
+            print("[!] No readings retrieved from Firebase.")
             return False
-
-        # 1. Parse and sort all records chronologically by valid timestamp
-        rows = []
-        for k, v in readings_data.items():
-            if isinstance(v, dict):
-                ts_raw = v.get('timestamp')
-                if ts_raw and ts_raw != 'TIME_ERROR':
-                    try:
-                        ts_dt = pd.to_datetime(ts_raw)
-                        rows.append({
-                            'key': k,
-                            'timestamp': ts_dt,
-                            'voltage1': float(v.get('voltage1', 230.0)),
-                            'voltage2': float(v.get('voltage2', 230.0)),
-                            'current1': float(v.get('current1', 0.0)),
-                            'current2': float(v.get('current2', 0.0)),
-                            'power1': float(v.get('power1', 0.0)),
-                            'power2': float(v.get('power2', 0.0)),
-                            'energy1': float(v.get('energy1', 0.0)),
-                            'energy2': float(v.get('energy2', 0.0)),
-                            'totalCurrent': float(v.get('totalCurrent', 0.0)),
-                            'totalPower': float(v.get('totalPower', 0.0)),
-                            'totalEnergy': float(v.get('totalEnergy', 0.0)),
-                        })
-                    except Exception:
-                        pass
-
-        if not rows:
-            print("[!] No valid timestamped records found.")
+            
+        print(f"[*] Retrieved {len(df)} readings from telemetry stream.")
+        
+        if len(df) < MIN_HISTORY_REQUIRED:
+            print(f"[!] Insufficient historical data for Enhanced RF prediction. Found: {len(df)}, Required: {MIN_HISTORY_REQUIRED}")
             return False
-
-        df_hist = pd.DataFrame(rows).sort_values('timestamp').reset_index(drop=True)
-
-        # 2. Select the record with the maximum timestamp as latest_reading
-        latest_row = df_hist.iloc[-1]
-        latest_reading = latest_row.to_dict()
-        print(f"[*] Latest Reading Key: {latest_reading['key']} | Time: {latest_reading['timestamp']} | Power: {latest_reading['totalPower']} W")
-
-        # 3. Run ML Random Forest Inference
-        prediction_result = self.ml_engine.predict(latest_reading, df_hist)
-
-        # 4. Run Energy Aggregation & Statistical Monthly Forecast
-        analytics_result = EnergyAnalyticsOptimizer.process_readings_history(df_hist, latest_reading)
-
-        # 5. Generate Dynamic Rule-Based Notifications & Alerts
-        notifications_list = EnergyAnalyticsOptimizer.generate_notifications(
-            prediction_result, analytics_result, latest_reading, df_hist
-        )
-
-        # 6. Publish results to Firebase
-        print("[*] Publishing ML Predictions to Firebase...")
-        self.firebase.put(PREDICTIONS_PATH, prediction_result)
-
-        print("[*] Publishing Energy Analytics & Forecast to Firebase...")
-        analytics_payload = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            **analytics_result["analytics"],
-            **analytics_result["forecast"]
-        }
-        self.firebase.put(ANALYTICS_PATH, analytics_payload)
-
-        print("[*] Publishing Optimization Insights to Firebase...")
-        opt_payload = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            **analytics_result["optimization"],
-            **analytics_result["forecast"]
-        }
-        self.firebase.put(OPTIMIZATION_PATH, opt_payload)
-
-        print("[*] Publishing Active Alerts to Firebase...")
-        notif_payload = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "count": len(notifications_list),
-            "items": notifications_list
-        }
-        self.firebase.put(NOTIFICATIONS_PATH, notif_payload)
-        self.firebase.put(ALERTS_PATH, notif_payload)
-
-        print("[+] Sync cycle completed successfully!")
+            
+        latest_reading = df.iloc[-1].to_dict()
+        
+        # ML Inference
+        preds = self.engine.predict(latest_reading, df)
+        analytics_res = self.analytics.compute_historical_analytics(df)
+        opt_res = self.analytics.generate_optimization_advisories(preds, analytics_res)
+        notif_res = self.analytics.generate_notifications(preds, analytics_res)
+        
+        print(f"[*] Predictions Generated for Timestamp: {preds['timestamp']}")
+        print(f"  Room 1 Next Hour: {preds['room1']['nextHour']['state']} ({preds['room1']['nextHour']['confidencePercent']}%)")
+        print(f"  Room 2 Next Hour: {preds['room2']['nextHour']['state']} ({preds['room2']['nextHour']['confidencePercent']}%)")
+        
+        # Publish to Firebase
+        if not self.mock_data_path:
+            self.fb.put(PREDICTIONS_PATH, preds)
+            if analytics_res: self.fb.put(ANALYTICS_PATH, analytics_res)
+            if opt_res: self.fb.put(OPTIMIZATION_PATH, opt_res)
+            if notif_res: self.fb.put(NOTIFICATIONS_PATH, notif_res)
+            print("[+] Successfully synced predictions, analytics, optimization & notifications to Firebase!")
+            
         return True
 
-    def run_daemon(self, interval_seconds=10):
-        print(f"[*] Starting continuous ML Bridge daemon (polling every {interval_seconds}s)...")
-        while True:
-            try:
-                self.run_sync()
-            except Exception as e:
-                print(f"[!] Error in sync cycle: {e}")
-            time.sleep(interval_seconds)
-
-
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Voltix Smart Energy Firebase ML Bridge")
-    parser.add_argument("--once", action="store_true", help="Run a single sync cycle and exit")
-    parser.add_argument("--interval", type=int, default=10, help="Daemon sync interval in seconds (default: 10)")
+    parser = argparse.ArgumentParser(description="VOLTIX Production ML Bridge")
+    parser.add_argument("--once", action="store_true", help="Run a single cycle")
+    parser.add_argument("--mock", action="store_true", help="Use local realistic dataset as mock stream")
     args = parser.parse_args()
+    
+    mock_file = os.path.join(BASE_DIR, "VOLTIX_realistic_30day_synthetic_dataset.csv") if args.mock else None
+    bridge = VoltixProductionBridge(mock_data_path=mock_file)
+    bridge.sync_once()
 
-    bridge = FirebaseMLBridge()
-
-    if args.once:
-        bridge.run_sync()
-    else:
-        bridge.run_daemon(interval_seconds=args.interval)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
