@@ -92,6 +92,11 @@ class FirebaseClient:
                 with urllib.request.urlopen(req, timeout=15) as response:
                     res_body = response.read().decode('utf-8')
                     return json.loads(res_body) if res_body and res_body != 'null' else None
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode('utf-8') if e.fp else ""
+                if attempt == retries - 1:
+                    print(f"[!] Firebase {method} HTTPError on {path}: {e.code} {e.reason} - {err_body}")
+                time.sleep(1.0)
             except Exception as e:
                 if attempt == retries - 1:
                     print(f"[!] Firebase {method} error on {path}: {e}")
@@ -593,7 +598,14 @@ class VoltixProductionBridge:
                 df = pd.read_csv(self.mock_data_path)
                 return df.tail(limit).reset_index(drop=True)
             return None
-        data = self.fb.get(READINGS_PATH, f'orderBy="timestamp"&limitToLast={limit}')
+        
+        # Primary query: orderBy="$key" matching Firebase RTDB indexed key order and Flutter orderByKey()
+        data = self.fb.get(READINGS_PATH, f'orderBy="$key"&limitToLast={limit}')
+        
+        # Fallback query: orderBy="timestamp" if custom index is configured
+        if not data:
+            data = self.fb.get(READINGS_PATH, f'orderBy="timestamp"&limitToLast={limit}')
+
         if not data:
             return None
         if isinstance(data, dict):
@@ -604,8 +616,8 @@ class VoltixProductionBridge:
             return None
         df = pd.DataFrame(records)
         if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            df = df.dropna(subset=['timestamp']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
         return df
 
     def sync_once(self):
