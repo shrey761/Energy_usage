@@ -29,8 +29,8 @@ OPTIMIZATION_PATH = "/sensor_logs/esp32_01/optimization/latest"
 NOTIFICATIONS_PATH = "/sensor_logs/esp32_01/notifications/latest"
 ALERTS_PATH = "/sensor_logs/esp32_01/alerts/latest"
 
-# 23 Baseline Features (for tomorrow and regression models)
-BASELINE_FEATURE_COLS = [
+# 23 Baseline / Production Features matching trained Random Forest models
+FEATURE_COLS = [
     'hour', 'dayofweek', 'is_weekend', 'hour_sin', 'hour_cos',
     'power1', 'power2', 'current1', 'current2', 'voltage1', 'voltage2',
     'totalPower', 'totalCurrent',
@@ -39,19 +39,8 @@ BASELINE_FEATURE_COLS = [
     'totalPower_lag1', 'totalPower_roll_mean5'
 ]
 
-FEATURE_COLS = BASELINE_FEATURE_COLS  # Backwards compatibility
-
-def load_enhanced_feature_schema():
-    if os.path.exists(SCHEMA_PATH):
-        try:
-            with open(SCHEMA_PATH, 'r') as f:
-                return json.load(f)['features']
-        except Exception:
-            pass
-    return []
-
-ENHANCED_FEATURE_COLS = load_enhanced_feature_schema()
-MIN_HISTORY_REQUIRED = 360  # 360 readings @ 10s = 1 hour
+BASELINE_FEATURE_COLS = FEATURE_COLS
+MIN_HISTORY_REQUIRED = 360  # Minimum historical telemetry records
 
 THRESHOLD_R1 = 40.0
 THRESHOLD_R2 = 10.0
@@ -121,6 +110,7 @@ class EnergyMLInferenceEngine:
         self.model_dir = model_dir
         self.models = self._load_models()
         self.thresholds = self._load_thresholds()
+        self._validate_startup_feature_schema()
 
     def _load_models(self):
         models = {}
@@ -146,13 +136,47 @@ class EnergyMLInferenceEngine:
                 pass
         return {'r1': 0.40, 'r2': 0.40}
 
-    def prepare_baseline_features(self, latest_reading, history_df=None):
+    def _validate_startup_feature_schema(self):
+        """
+        Validates at startup that all loaded Random Forest models match FEATURE_COLS exactly.
+        """
+        print("=" * 80)
+        print(" VOLTIX ML FEATURE SCHEMA STARTUP VALIDATION")
+        print("=" * 80)
+        print(f"Target Feature Schema ({len(FEATURE_COLS)} features):")
+        print(f"  {FEATURE_COLS}\n")
+
+        all_valid = True
+        for model_name, model in self.models.items():
+            expected = getattr(model, 'feature_names_in_', None)
+            if expected is None:
+                print(f"  [?] Model '{model_name}': No feature_names_in_ metadata.")
+                continue
+
+            expected_list = list(expected)
+            if expected_list == FEATURE_COLS:
+                print(f"  [+] Model '{model_name}': 100% SCHEMA MATCH ({len(expected_list)}/{len(FEATURE_COLS)} features identical)")
+            else:
+                all_valid = False
+                missing = [f for f in expected_list if f not in FEATURE_COLS]
+                extra = [f for f in FEATURE_COLS if f not in expected_list]
+                print(f"  [!] Model '{model_name}': SCHEMA MISMATCH!")
+                if missing: print(f"      Missing from inference schema: {missing}")
+                if extra: print(f"      Extra in inference schema: {extra}")
+
+        if not all_valid:
+            raise ValueError("Startup Feature Schema Validation Failed: Model schema mismatch!")
+        print("=" * 80 + "\n")
+
+    def prepare_features(self, latest_reading, history_df=None):
         ts = latest_reading.get('timestamp', None)
         if isinstance(ts, str):
             try: dt = pd.to_datetime(ts)
             except Exception: dt = datetime.now()
-        elif isinstance(ts, (datetime, pd.Timestamp)): dt = ts
-        else: dt = datetime.now()
+        elif isinstance(ts, (datetime, pd.Timestamp)):
+            dt = ts
+        else:
+            dt = datetime.now()
 
         hour = int(latest_reading.get('hour', dt.hour))
         dayofweek = int(latest_reading.get('dayofweek', dt.weekday()))
@@ -167,6 +191,7 @@ class EnergyMLInferenceEngine:
         tp = float(latest_reading.get('totalPower', p1 + p2))
         tc = float(latest_reading.get('totalCurrent', c1 + c2))
 
+        # Calculate lag and rolling features from historical telemetry if available
         if history_df is not None and len(history_df) >= 1:
             hist = history_df.sort_values('timestamp').reset_index(drop=True)
             p1_lag1 = float(hist['power1'].iloc[-2] if len(hist) >= 2 else p1)
@@ -220,172 +245,45 @@ class EnergyMLInferenceEngine:
             'totalPower_lag1': tp_lag1,
             'totalPower_roll_mean5': tp_mean5
         }
-        return pd.DataFrame([row_dict])[BASELINE_FEATURE_COLS], dt, p1, p2, tp
+        return pd.DataFrame([row_dict])[FEATURE_COLS], dt, p1, p2, tp
 
-    def prepare_enhanced_features(self, history_df):
-        """
-        Constructs the exact 126-feature vector from historical telemetry.
-        """
-        if history_df is None or len(history_df) < MIN_HISTORY_REQUIRED:
-            avail = len(history_df) if history_df is not None else 0
-            raise ValueError(f"Insufficient historical data for Enhanced RF prediction. Required: {MIN_HISTORY_REQUIRED}, Available: {avail}")
-            
-        df = history_df.copy()
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.sort_values('timestamp').reset_index(drop=True)
-        else:
-            raise ValueError("Missing 'timestamp' column in history DataFrame.")
-            
-        required_cols = ['current1', 'current2', 'energy1', 'energy2', 'power1', 'power2',
-                         'totalCurrent', 'totalEnergy', 'totalPower', 'voltage1', 'voltage2']
-        for c in required_cols:
-            if c not in df.columns:
-                if c in ['energy1', 'energy2', 'totalEnergy']:
-                    df[c] = 0.0
-                else:
-                    raise ValueError(f"Missing required telemetry field: '{c}'")
-                
-        latest_ts = df['timestamp'].iloc[-1]
-        df['hour'] = df['timestamp'].dt.hour
-        df['minute'] = df['timestamp'].dt.minute
-        df['day_of_week'] = df['timestamp'].dt.dayofweek
-        df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
-        df['month'] = df['timestamp'].dt.month
-        
-        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24.0)
-        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24.0)
-        df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7.0)
-        df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7.0)
-        
-        df['power_ratio'] = df['power1'] / (df['totalPower'] + 1e-6)
-        df['apparent_power_1'] = df['voltage1'] * df['current1']
-        df['apparent_power_2'] = df['voltage2'] * df['current2']
-        
-        new_cols = {}
-        lags = [1, 3, 6, 30, 60, 180, 360]
-        for col in ['power1', 'power2', 'totalPower']:
-            for lag in lags:
-                new_cols[f'{col}_lag{lag}'] = df[col].shift(lag)
-                
-        windows = {'1m': 6, '5m': 30, '15m': 90, '30m': 180, '1h': 360}
-        for col in ['power1', 'power2', 'totalPower']:
-            for w_name, w_size in windows.items():
-                roll = df[col].rolling(window=w_size, min_periods=1)
-                new_cols[f'{col}_roll_mean{w_name}'] = roll.mean()
-                new_cols[f'{col}_roll_min{w_name}'] = roll.min()
-                new_cols[f'{col}_roll_max{w_name}'] = roll.max()
-                new_cols[f'{col}_roll_std{w_name}'] = roll.std().fillna(0.0)
-                
-        for col in ['power1', 'power2', 'totalPower']:
-            new_cols[f'{col}_diff_1m'] = df[col] - df[col].shift(6)
-            new_cols[f'{col}_diff_5m'] = df[col] - df[col].shift(30)
-            new_cols[f'{col}_diff_15m'] = df[col] - df[col].shift(90)
-            new_cols[f'{col}_diff_1h'] = df[col] - df[col].shift(360)
-            
-        def compute_durations(power_series, threshold):
-            is_on = (power_series >= threshold).astype(int).values
-            n = len(is_on)
-            consec_on = np.zeros(n)
-            consec_off = np.zeros(n)
-            since_trans = np.zeros(n)
-            
-            cur_on = 0
-            cur_off = 0
-            cur_trans = 0
-            for i in range(n):
-                if is_on[i] == 1:
-                    cur_on += 1
-                    cur_off = 0
-                else:
-                    cur_off += 1
-                    cur_on = 0
-                
-                if i > 0 and is_on[i] != is_on[i-1]:
-                    cur_trans = 0
-                else:
-                    cur_trans += 1
-                    
-                consec_on[i] = cur_on * (10.0 / 60.0)
-                consec_off[i] = cur_off * (10.0 / 60.0)
-                since_trans[i] = cur_trans * (10.0 / 60.0)
-                
-            return is_on, consec_on, consec_off, since_trans
-
-        r1_on_state, r1_on, r1_off, r1_trans = compute_durations(df['power1'], THRESHOLD_R1)
-        new_cols['r1_is_on'] = r1_on_state
-        new_cols['r1_consec_on_min'] = r1_on
-        new_cols['r1_consec_off_min'] = r1_off
-        new_cols['r1_min_since_trans'] = r1_trans
-        
-        r2_on_state, r2_on, r2_off, r2_trans = compute_durations(df['power2'], THRESHOLD_R2)
-        new_cols['r2_is_on'] = r2_on_state
-        new_cols['r2_consec_on_min'] = r2_on
-        new_cols['r2_consec_off_min'] = r2_off
-        new_cols['r2_min_since_trans'] = r2_trans
-        
-        new_df = pd.DataFrame(new_cols, index=df.index)
-        df = pd.concat([df, new_df], axis=1)
-        
-        df['date'] = df['timestamp'].dt.date
-        today_date = latest_ts.date()
-        today_mask = (df['date'] == today_date)
-        
-        df['r1_daily_cum_on_min'] = 0.0
-        df.loc[today_mask, 'r1_daily_cum_on_min'] = ((df.loc[today_mask, 'power1'] >= THRESHOLD_R1).astype(float) * (10.0 / 60.0)).cumsum()
-        
-        df['r2_daily_cum_on_min'] = 0.0
-        df.loc[today_mask, 'r2_daily_cum_on_min'] = ((df.loc[today_mask, 'power2'] >= THRESHOLD_R2).astype(float) * (10.0 / 60.0)).cumsum()
-        
-        latest_row = df.iloc[-1:]
-        
-        if len(ENHANCED_FEATURE_COLS) > 0:
-            generated = [c for c in ENHANCED_FEATURE_COLS if c in latest_row.columns]
-            if len(generated) != 126 or generated != ENHANCED_FEATURE_COLS:
-                raise ValueError(f"Feature schema mismatch! Expected 126 features. Found {len(generated)}")
-            X_enh = latest_row[ENHANCED_FEATURE_COLS]
-        else:
-            X_enh = latest_row
-            
-        return X_enh, latest_ts, float(latest_row['power1'].values[0]), float(latest_row['power2'].values[0])
+    def prepare_baseline_features(self, latest_reading, history_df=None):
+        return self.prepare_features(latest_reading, history_df)
 
     def predict(self, latest_reading, history_df=None):
-        X_base, dt, p1, p2, tp = self.prepare_baseline_features(latest_reading, history_df)
+        X_feats, dt, p1, p2, tp = self.prepare_features(latest_reading, history_df)
         
-        # Determine Enhanced features vector
-        if history_df is not None and len(history_df) >= MIN_HISTORY_REQUIRED:
-            X_enh, _, _, _ = self.prepare_enhanced_features(history_df)
-        else:
-            # Steady-state baseline fallback for isolated single reading invocation
-            fallback_hist = pd.DataFrame([latest_reading] * MIN_HISTORY_REQUIRED)
-            fallback_hist['timestamp'] = [datetime.now() - pd.Timedelta(seconds=(MIN_HISTORY_REQUIRED-1-i)*10) for i in range(MIN_HISTORY_REQUIRED)]
-            X_enh, _, _, _ = self.prepare_enhanced_features(fallback_hist)
+        # Verify schema match before predicting
+        if list(X_feats.columns) != FEATURE_COLS:
+            raise ValueError(f"Feature schema mismatch! Expected {FEATURE_COLS}, got {list(X_feats.columns)}")
 
-        # 1. Room 1 Predictions (Enhanced RF for 1-Hour)
-        r1_next_probas = self.models['r1_next_hour'].predict_proba(X_enh)[0]
-        r1_next_state = "HIGH USAGE" if r1_next_probas[1] >= 0.5 else "NORMAL"
+        # 1. Room 1 Predictions (1-Hour Ahead Classifier)
+        r1_next_probas = self.models['r1_next_hour'].predict_proba(X_feats)[0]
+        r1_next_state = "HIGH USAGE" if r1_next_probas[1] >= 0.50 else "NORMAL"
         r1_next_conf = float(r1_next_probas[1 if r1_next_state == "HIGH USAGE" else 0])
 
-        # 1. Room 1 Tomorrow (Baseline RF for 24-Hour)
+        # 2. Room 1 Tomorrow Predictions (24-Hour Ahead Classifier with calibrated threshold)
         th_r1 = self.thresholds.get('r1', 0.40)
-        r1_tmrw_probas = self.models['r1_tomorrow'].predict_proba(X_base)[0]
+        r1_tmrw_probas = self.models['r1_tomorrow'].predict_proba(X_feats)[0]
         r1_tmrw_state = "HIGH USAGE" if r1_tmrw_probas[1] >= th_r1 else "NORMAL"
         r1_tmrw_conf = float(r1_tmrw_probas[1 if r1_tmrw_state == "HIGH USAGE" else 0])
 
-        r1_pred_power = max(0.0, float(self.models['r1_reg_next'].predict(X_base)[0]))
+        # 3. Room 1 1-Hour Ahead Continuous Power Regressor
+        r1_pred_power = max(0.0, float(self.models['r1_reg_next'].predict(X_feats)[0]))
 
-        # 2. Room 2 Predictions (Enhanced RF for 1-Hour)
-        r2_next_probas = self.models['r2_next_hour'].predict_proba(X_enh)[0]
-        r2_next_state = "HIGH USAGE" if r2_next_probas[1] >= 0.5 else "NORMAL"
+        # 4. Room 2 Predictions (1-Hour Ahead Classifier)
+        r2_next_probas = self.models['r2_next_hour'].predict_proba(X_feats)[0]
+        r2_next_state = "HIGH USAGE" if r2_next_probas[1] >= 0.50 else "NORMAL"
         r2_next_conf = float(r2_next_probas[1 if r2_next_state == "HIGH USAGE" else 0])
 
-        # 2. Room 2 Tomorrow (Baseline RF for 24-Hour)
+        # 5. Room 2 Tomorrow Predictions (24-Hour Ahead Classifier with calibrated threshold)
         th_r2 = self.thresholds.get('r2', 0.40)
-        r2_tmrw_probas = self.models['r2_tomorrow'].predict_proba(X_base)[0]
+        r2_tmrw_probas = self.models['r2_tomorrow'].predict_proba(X_feats)[0]
         r2_tmrw_state = "HIGH USAGE" if r2_tmrw_probas[1] >= th_r2 else "NORMAL"
         r2_tmrw_conf = float(r2_tmrw_probas[1 if r2_tmrw_state == "HIGH USAGE" else 0])
 
-        r2_pred_power = max(0.0, float(self.models['r2_reg_next'].predict(X_base)[0]))
+        # 6. Room 2 1-Hour Ahead Continuous Power Regressor
+        r2_pred_power = max(0.0, float(self.models['r2_reg_next'].predict(X_feats)[0]))
 
         # Recommendations
         r1_recs = []
@@ -725,12 +623,13 @@ class VoltixProductionBridge:
 
     def sync_once(self, force=True):
         df = self.fetch_readings(limit=400)
+        now_time = datetime.now().strftime('%H:%M:%S')
         if df is None or len(df) == 0:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [!] No readings retrieved from Firebase.")
+            print(f"[{now_time}] [!] No readings retrieved from Firebase.")
             return False, None
             
         if len(df) < MIN_HISTORY_REQUIRED:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [!] Insufficient historical data for Enhanced RF prediction. Found: {len(df)}, Required: {MIN_HISTORY_REQUIRED}")
+            print(f"[{now_time}] [!] Insufficient historical data for Enhanced RF prediction. Found: {len(df)}, Required: {MIN_HISTORY_REQUIRED}")
             return False, None
             
         latest_reading = df.iloc[-1].to_dict()
@@ -746,8 +645,7 @@ class VoltixProductionBridge:
         opt_res = self.analytics.generate_optimization_advisories(preds, analytics_res)
         notif_res = self.analytics.generate_notifications(preds, analytics_res)
         
-        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f"\n[{now_str}] [*] Telemetry Updated (Timestamp: {preds['timestamp']}, Window: {len(df)} readings)")
+        print(f"\n[{now_time}] [*] Telemetry Updated (Timestamp: {preds['timestamp']}, Window: {len(df)} readings)")
         print(f"  Room 1 (Measured: {preds['room1']['currentPower']}W -> Predicted: {preds['room1']['predictedPower']}W) | Next Hour: {preds['room1']['nextHour']['state']} ({preds['room1']['nextHour']['confidencePercent']}%) | Tomorrow: {preds['room1']['tomorrow']['state']}")
         print(f"  Room 2 (Measured: {preds['room2']['currentPower']}W -> Predicted: {preds['room2']['predictedPower']}W) | Next Hour: {preds['room2']['nextHour']['state']} ({preds['room2']['nextHour']['confidencePercent']}%) | Tomorrow: {preds['room2']['tomorrow']['state']}")
         print(f"  Total Load: {preds['summary']['totalCurrentPower']}W -> Predicted: {preds['summary']['totalPredictedPower']}W | Overall: {preds['summary']['overallNextHourState']}")
@@ -758,7 +656,7 @@ class VoltixProductionBridge:
             if analytics_res: self.fb.put(ANALYTICS_PATH, analytics_res)
             if opt_res: self.fb.put(OPTIMIZATION_PATH, opt_res)
             if notif_res: self.fb.put(NOTIFICATIONS_PATH, notif_res)
-            print("  [+] Successfully synced predictions, analytics, optimization & notifications to Firebase!")
+            print("  [+] Successfully synced predictions, analytics, optimization & notifications to Firebase!\n")
             
         self._last_synced_ts = latest_ts
         return True, latest_ts
@@ -770,7 +668,7 @@ class VoltixProductionBridge:
         and pushes predictions to Firebase in real time.
         """
         print("=" * 80)
-        print(" VOLTIX PRODUCTION FIREBASE ML BRIDGE — CONTINUOUS INFERENCE LOOP")
+        print(" VOLTIX PRODUCTION FIREBASE ML BRIDGE - CONTINUOUS INFERENCE LOOP")
         print(f" Telemetry Stream: {READINGS_PATH}")
         print(f" Poll Interval: {poll_interval}s | Minimum History: {MIN_HISTORY_REQUIRED} readings")
         print(" Press Ctrl+C to stop.")
@@ -779,10 +677,15 @@ class VoltixProductionBridge:
         cycles = 0
         try:
             while True:
-                synced, latest_ts = self.sync_once(force=(cycles == 0))
-                if not synced and latest_ts is not None:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [*] Telemetry unchanged ({latest_ts}). Waiting for next ESP32 update...", end='\r')
-                
+                try:
+                    synced, latest_ts = self.sync_once(force=(cycles == 0))
+                    if not synced and latest_ts is not None:
+                        now_time = datetime.now().strftime('%H:%M:%S')
+                        print(f"[{now_time}] [*] Telemetry unchanged ({latest_ts}). Waiting for next ESP32 update...")
+                except Exception as e:
+                    now_time = datetime.now().strftime('%H:%M:%S')
+                    print(f"[{now_time}] [!] Error during inference cycle: {e}. Retrying in {poll_interval}s...")
+
                 cycles += 1
                 if max_cycles is not None and cycles >= max_cycles:
                     print(f"\n[*] Completed requested {max_cycles} cycle(s).")

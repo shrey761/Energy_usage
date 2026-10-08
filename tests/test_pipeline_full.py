@@ -21,7 +21,6 @@ from firebase_ml_bridge import (
     EnergyAnalyticsOptimizer,
     FirebaseClient,
     BASELINE_FEATURE_COLS,
-    ENHANCED_FEATURE_COLS,
     FEATURE_COLS,
     MODEL_DIR,
     FIREBASE_DB_URL
@@ -48,16 +47,13 @@ class TestVoltixMLPipeline(unittest.TestCase):
         self.assertEqual(self.engine.thresholds['r2'], 0.40)
 
     def test_02_feature_count_and_order(self):
-        """Verify baseline (23) and enhanced (126) feature schemas and ordering."""
+        """Verify feature schema matches the 23 features expected by the 6 trained models."""
+        self.assertEqual(len(FEATURE_COLS), 23)
         self.assertEqual(len(BASELINE_FEATURE_COLS), 23)
-        self.assertEqual(len(ENHANCED_FEATURE_COLS), 126)
-        
-        # Verify first 10 enhanced feature names
-        expected_first_10 = [
-            'current1', 'current2', 'energy1', 'energy2', 'power1',
-            'power2', 'totalCurrent', 'totalEnergy', 'totalPower', 'voltage1'
-        ]
-        self.assertEqual(ENHANCED_FEATURE_COLS[:10], expected_first_10)
+        for model_name, model in self.engine.models.items():
+            if hasattr(model, 'feature_names_in_'):
+                self.assertEqual(list(model.feature_names_in_), FEATURE_COLS, f"Schema mismatch in {model_name}")
+
 
     def test_03_inference_predictions(self):
         """Verify inference output structure and predict_proba calculations on calibrated loads."""
