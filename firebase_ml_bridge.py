@@ -639,15 +639,13 @@ class VoltixProductionBridge:
                     df = df[~df['timestamp'].astype(str).str.strip().isin(['TIME_ERROR', 'null', 'None', '', 'undefined'])]
                     df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
                     df = df.dropna(subset=['timestamp']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
-                return df.tail(limit).reset_index(drop=True)
+                if limit and len(df) > limit:
+                    df = df.tail(limit).reset_index(drop=True)
+                return df
             return None
         
-        # Primary query: orderBy="$key" matching Firebase RTDB indexed key order and Flutter orderByKey()
-        data = self.fb.get(READINGS_PATH, f'orderBy="$key"&limitToLast={limit}')
-        
-        # Fallback query: orderBy="timestamp" if custom index is configured
-        if not data:
-            data = self.fb.get(READINGS_PATH, f'orderBy="timestamp"&limitToLast={limit}')
+        # Fetch all readings directly from Firebase to avoid lexicographical string key ordering omission
+        data = self.fb.get(READINGS_PATH)
 
         if not data:
             return None
@@ -657,6 +655,8 @@ class VoltixProductionBridge:
             records = [r for r in data if r is not None]
         else:
             return None
+
+        raw_count = len(records)
         df = pd.DataFrame(records)
         if 'timestamp' in df.columns:
             # 6. Remove/ignore invalid timestamp values before parsing (TIME_ERROR, empty/null, malformed)
@@ -665,13 +665,29 @@ class VoltixProductionBridge:
             # 7. Parse valid timestamps explicitly using format='%Y-%m-%d %H:%M:%S'
             df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
             # 8. Drop rows where timestamp became NaT
-            # 9. Sort valid records chronologically by timestamp
+            # 9. Sort valid records strictly chronologically by parsed timestamp (NOT by key order)
             df = df.dropna(subset=['timestamp']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
+
+        valid_count = len(df)
+        if valid_count > 0:
+            newest_5 = [ts.strftime('%Y-%m-%d %H:%M:%S') for ts in df['timestamp'].tail(5)]
+            selected_ts = df.iloc[-1]['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            newer_exist = len(df[df['timestamp'] > df.iloc[-1]['timestamp']]) > 0
+            
+            print(f"  [DIAGNOSTIC] Records fetched from Firebase: {raw_count} raw, {valid_count} valid")
+            print(f"  [DIAGNOSTIC] Newest 5 valid timestamps: {newest_5}")
+            print(f"  [DIAGNOSTIC] Timestamp selected for inference: {selected_ts}")
+            print(f"  [DIAGNOSTIC] Newer reading exists beyond selected: {newer_exist}")
+
+        # Limit window to the newest N chronological readings for model inference & history window
+        if limit and len(df) > limit:
+            df = df.tail(limit).reset_index(drop=True)
+
         return df
 
     def sync_once(self, force=True):
-        df = self.fetch_readings(limit=400)
         now_time = datetime.now().strftime('%H:%M:%S')
+        df = self.fetch_readings(limit=400)
         if df is None or len(df) == 0:
             print(f"[{now_time}] [!] No readings retrieved from Firebase.")
             return False, None
@@ -681,10 +697,11 @@ class VoltixProductionBridge:
             return False, None
             
         latest_reading = df.iloc[-1].to_dict()
-        latest_ts = str(latest_reading.get('timestamp', ''))
+        latest_ts = df.iloc[-1]['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(df.iloc[-1]['timestamp'], (pd.Timestamp, datetime)) else str(latest_reading.get('timestamp', ''))
 
         # Avoid duplicate prediction & write cycles if telemetry is unchanged
         if not force and hasattr(self, '_last_synced_ts') and self._last_synced_ts == latest_ts:
+            print(f"[{now_time}] [*] Telemetry unchanged ({latest_ts}). Firebase contains no newer readings. Waiting for next ESP32 update...")
             return False, latest_ts
 
         # ML Inference
@@ -712,7 +729,7 @@ class VoltixProductionBridge:
     def run_loop(self, poll_interval=10, max_cycles=None):
         """
         Continuous live inference loop.
-        Monitors telemetry every `poll_interval` seconds, generates 126 causal features,
+        Monitors telemetry every `poll_interval` seconds, generates 23 causal features,
         and pushes predictions to Firebase in real time.
         """
         print("=" * 80)
@@ -727,9 +744,6 @@ class VoltixProductionBridge:
             while True:
                 try:
                     synced, latest_ts = self.sync_once(force=(cycles == 0))
-                    if not synced and latest_ts is not None:
-                        now_time = datetime.now().strftime('%H:%M:%S')
-                        print(f"[{now_time}] [*] Telemetry unchanged ({latest_ts}). Waiting for next ESP32 update...")
                 except Exception as e:
                     now_time = datetime.now().strftime('%H:%M:%S')
                     print(f"[{now_time}] [!] Error during inference cycle: {e}. Retrying in {poll_interval}s...")
