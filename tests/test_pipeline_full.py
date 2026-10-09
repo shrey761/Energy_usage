@@ -127,5 +127,42 @@ class TestVoltixMLPipeline(unittest.TestCase):
         self.assertIn(res['room2']['nextHour']['state'], ['HIGH USAGE', 'NORMAL'])
         self.assertGreaterEqual(res['room1']['nextHour']['confidencePercent'], 50.0)
 
+    def test_06_invalid_timestamp_sanitization(self):
+        """Verify TIME_ERROR, null, and malformed timestamps are safely sanitized without warnings."""
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+
+            # Test reading with TIME_ERROR
+            reading_err = {
+                'timestamp': 'TIME_ERROR',
+                'power1': 60.0,
+                'power2': 0.0,
+                'voltage1': 230.0,
+                'voltage2': 230.0,
+                'totalPower': 60.0,
+                'totalCurrent': 0.26
+            }
+            feats, dt, p1, p2, tp = self.engine.prepare_features(reading_err)
+            self.assertEqual(len(feats.columns), 23)
+            self.assertIsNotNone(dt)
+
+            # Test history_df containing TIME_ERROR, None, and valid out-of-order timestamps
+            history_data = [
+                {'timestamp': '2026-10-08 14:00:10', 'power1': 50.0, 'power2': 10.0, 'totalPower': 60.0, 'totalEnergy': 1.0},
+                {'timestamp': 'TIME_ERROR', 'power1': 99.0, 'power2': 99.0, 'totalPower': 198.0, 'totalEnergy': 1.1},
+                {'timestamp': '2026-10-08 14:00:00', 'power1': 40.0, 'power2': 10.0, 'totalPower': 50.0, 'totalEnergy': 0.9},
+                {'timestamp': None, 'power1': 0.0, 'power2': 0.0, 'totalPower': 0.0, 'totalEnergy': 1.2},
+                {'timestamp': '2026-10-08 14:00:20', 'power1': 60.0, 'power2': 10.0, 'totalPower': 70.0, 'totalEnergy': 1.2},
+            ]
+            df_hist = pd.DataFrame(history_data)
+            res = self.engine.predict(reading_err, df_hist)
+            self.assertIn('room1', res)
+            self.assertIn('room2', res)
+
+            # Check that no UserWarning for datetime format inference was triggered
+            dateutil_warnings = [warning for warning in w if 'dateutil' in str(warning.message) or 'Could not infer format' in str(warning.message)]
+            self.assertEqual(len(dateutil_warnings), 0, "Found unexpected dateutil fallback warnings!")
+
 if __name__ == '__main__':
     unittest.main()

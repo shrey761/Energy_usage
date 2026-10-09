@@ -171,10 +171,20 @@ class EnergyMLInferenceEngine:
     def prepare_features(self, latest_reading, history_df=None):
         ts = latest_reading.get('timestamp', None)
         if isinstance(ts, str):
-            try: dt = pd.to_datetime(ts)
-            except Exception: dt = datetime.now()
+            ts_str = ts.strip()
+            if ts_str in ['TIME_ERROR', 'null', 'None', '', 'undefined']:
+                dt = datetime.now()
+            else:
+                try:
+                    parsed_ts = pd.to_datetime(ts_str, format='%Y-%m-%d %H:%M:%S', errors='coerce')
+                    if pd.isna(parsed_ts):
+                        dt = datetime.now()
+                    else:
+                        dt = parsed_ts.to_pydatetime()
+                except Exception:
+                    dt = datetime.now()
         elif isinstance(ts, (datetime, pd.Timestamp)):
-            dt = ts
+            dt = ts.to_pydatetime() if hasattr(ts, 'to_pydatetime') else ts
         else:
             dt = datetime.now()
 
@@ -193,19 +203,40 @@ class EnergyMLInferenceEngine:
 
         # Calculate lag and rolling features from historical telemetry if available
         if history_df is not None and len(history_df) >= 1:
-            hist = history_df.sort_values('timestamp').reset_index(drop=True)
-            p1_lag1 = float(hist['power1'].iloc[-2] if len(hist) >= 2 else p1)
-            p1_lag3 = float(hist['power1'].iloc[-4] if len(hist) >= 4 else p1)
-            p1_mean5 = float(hist['power1'].iloc[-5:].mean())
-            p1_max5 = float(hist['power1'].iloc[-5:].max())
+            hist = history_df.copy()
+            if 'timestamp' in hist.columns:
+                if not pd.api.types.is_datetime64_any_dtype(hist['timestamp']):
+                    hist = hist[hist['timestamp'].notna()]
+                    hist = hist[~hist['timestamp'].astype(str).str.strip().isin(['TIME_ERROR', 'null', 'None', '', 'undefined'])]
+                    hist['timestamp'] = pd.to_datetime(hist['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+                hist = hist.dropna(subset=['timestamp']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
 
-            p2_lag1 = float(hist['power2'].iloc[-2] if len(hist) >= 2 else p2)
-            p2_lag3 = float(hist['power2'].iloc[-4] if len(hist) >= 4 else p2)
-            p2_mean5 = float(hist['power2'].iloc[-5:].mean())
-            p2_max5 = float(hist['power2'].iloc[-5:].max())
+            if len(hist) >= 1:
+                p1_lag1 = float(hist['power1'].iloc[-2] if len(hist) >= 2 else p1)
+                p1_lag3 = float(hist['power1'].iloc[-4] if len(hist) >= 4 else p1)
+                p1_mean5 = float(hist['power1'].iloc[-5:].mean())
+                p1_max5 = float(hist['power1'].iloc[-5:].max())
 
-            tp_lag1 = float(hist['totalPower'].iloc[-2] if len(hist) >= 2 else tp)
-            tp_mean5 = float(hist['totalPower'].iloc[-5:].mean())
+                p2_lag1 = float(hist['power2'].iloc[-2] if len(hist) >= 2 else p2)
+                p2_lag3 = float(hist['power2'].iloc[-4] if len(hist) >= 4 else p2)
+                p2_mean5 = float(hist['power2'].iloc[-5:].mean())
+                p2_max5 = float(hist['power2'].iloc[-5:].max())
+
+                tp_lag1 = float(hist['totalPower'].iloc[-2] if len(hist) >= 2 else tp)
+                tp_mean5 = float(hist['totalPower'].iloc[-5:].mean())
+            else:
+                p1_lag1 = float(latest_reading.get('power1_lag1', p1))
+                p1_lag3 = float(latest_reading.get('power1_lag3', p1))
+                p1_mean5 = float(latest_reading.get('power1_roll_mean5', p1))
+                p1_max5 = float(latest_reading.get('power1_roll_max5', p1))
+
+                p2_lag1 = float(latest_reading.get('power2_lag1', p2))
+                p2_lag3 = float(latest_reading.get('power2_lag3', p2))
+                p2_mean5 = float(latest_reading.get('power2_roll_mean5', p2))
+                p2_max5 = float(latest_reading.get('power2_roll_max5', p2))
+
+                tp_lag1 = float(latest_reading.get('totalPower_lag1', tp))
+                tp_mean5 = float(latest_reading.get('totalPower_roll_mean5', tp))
         else:
             p1_lag1 = float(latest_reading.get('power1_lag1', p1))
             p1_lag3 = float(latest_reading.get('power1_lag3', p1))
@@ -365,9 +396,15 @@ class EnergyAnalyticsOptimizer:
 
         df = readings_df.copy()
         if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.sort_values('timestamp').reset_index(drop=True)
-            now = df['timestamp'].iloc[-1]
+            if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+                df = df[df['timestamp'].notna()]
+                df = df[~df['timestamp'].astype(str).str.strip().isin(['TIME_ERROR', 'null', 'None', '', 'undefined'])]
+                df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+            df = df.dropna(subset=['timestamp']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
+            if len(df) > 0:
+                now = df['timestamp'].iloc[-1]
+            else:
+                now = datetime.now()
         else:
             now = datetime.now()
 
@@ -597,6 +634,11 @@ class VoltixProductionBridge:
         if self.mock_data_path:
             if os.path.exists(self.mock_data_path):
                 df = pd.read_csv(self.mock_data_path)
+                if 'timestamp' in df.columns:
+                    df = df[df['timestamp'].notna()]
+                    df = df[~df['timestamp'].astype(str).str.strip().isin(['TIME_ERROR', 'null', 'None', '', 'undefined'])]
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+                    df = df.dropna(subset=['timestamp']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
                 return df.tail(limit).reset_index(drop=True)
             return None
         
@@ -617,7 +659,13 @@ class VoltixProductionBridge:
             return None
         df = pd.DataFrame(records)
         if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            # 6. Remove/ignore invalid timestamp values before parsing (TIME_ERROR, empty/null, malformed)
+            df = df[df['timestamp'].notna()]
+            df = df[~df['timestamp'].astype(str).str.strip().isin(['TIME_ERROR', 'null', 'None', '', 'undefined'])]
+            # 7. Parse valid timestamps explicitly using format='%Y-%m-%d %H:%M:%S'
+            df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+            # 8. Drop rows where timestamp became NaT
+            # 9. Sort valid records chronologically by timestamp
             df = df.dropna(subset=['timestamp']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
         return df
 
