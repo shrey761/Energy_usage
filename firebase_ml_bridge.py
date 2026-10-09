@@ -316,22 +316,26 @@ class EnergyMLInferenceEngine:
         # 6. Room 2 1-Hour Ahead Continuous Power Regressor
         r2_pred_power = max(0.0, float(self.models['r2_reg_next'].predict(X_feats)[0]))
 
-        # Recommendations
+        # Recommendations (Dynamic & Data-Driven)
         r1_recs = []
-        if r1_next_state == "HIGH USAGE":
-            r1_recs.append("Reduce non-essential loads in Room 1 during the next hour.")
-        if r1_tmrw_state == "HIGH USAGE":
-            r1_recs.append("Consider shifting flexible loads in Room 1 away from this period tomorrow.")
-        if not r1_recs:
-            r1_recs.append("Room 1 usage is normal. No load reduction required.")
+        if p1 >= 150.0 and r1_next_state == "HIGH USAGE":
+            r1_recs.append(f"Elevated active load in Room 1 ({round(p1, 1)}W). Defer non-essential equipment during the upcoming peak.")
+        elif r1_next_state == "HIGH USAGE" and r1_pred_power > 80.0:
+            r1_recs.append(f"Elevated demand predicted in Room 1 ({round(r1_pred_power, 1)}W). Consider shifting flexible loads.")
+        elif r1_tmrw_state == "HIGH USAGE":
+            r1_recs.append("Elevated demand predicted for tomorrow around this time. Plan high-power tasks during off-peak windows.")
+        else:
+            r1_recs.append("Room 1 load is within normal operating limits. No reduction needed.")
 
         r2_recs = []
-        if r2_next_state == "HIGH USAGE":
-            r2_recs.append("Reduce non-essential loads in Room 2 during the next hour.")
-        if r2_tmrw_state == "HIGH USAGE":
-            r2_recs.append("Consider shifting flexible loads in Room 2 away from this period tomorrow.")
-        if not r2_recs:
-            r2_recs.append("Room 2 usage is normal. No load reduction required.")
+        if p2 >= 60.0 and r2_next_state == "HIGH USAGE":
+            r2_recs.append(f"Elevated active load in Room 2 ({round(p2, 1)}W). Consider switching off secondary appliances.")
+        elif r2_next_state == "HIGH USAGE" and r2_pred_power > 30.0:
+            r2_recs.append(f"Elevated demand predicted in Room 2 ({round(r2_pred_power, 1)}W). Optimize appliance usage.")
+        elif r2_tmrw_state == "HIGH USAGE":
+            r2_recs.append("Elevated demand predicted for tomorrow around this time in Room 2.")
+        else:
+            r2_recs.append("Room 2 load is within normal operating limits. No reduction needed.")
 
         return {
             "timestamp": dt.strftime("%Y-%m-%d %H:%M:%S"),
@@ -506,18 +510,23 @@ class EnergyAnalyticsOptimizer:
         r1 = predictions_dict.get('room1', {})
         r2 = predictions_dict.get('room2', {})
         summary = predictions_dict.get('summary', {})
+        tot_pred_p = summary.get('totalPredictedPower', 0.0)
+        tot_curr_p = summary.get('totalCurrentPower', 0.0)
+
+        r1_p = r1.get('currentPower', 0.0)
+        r2_p = r2.get('currentPower', 0.0)
 
         active_loads = []
-        if r1.get('nextHour', {}).get('state') == 'HIGH USAGE':
-            active_loads.append("Room 1 Lighting/Appliances (40W+)")
-        if r2.get('nextHour', {}).get('state') == 'HIGH USAGE':
-            active_loads.append("Room 2 Lighting/Appliances (10W+)")
+        if r1_p >= 150.0 or (r1.get('nextHour', {}).get('state') == 'HIGH USAGE' and tot_pred_p > 100.0):
+            active_loads.append(f"Room 1 ({round(r1_p, 1)}W)")
+        if r2_p >= 60.0 or (r2.get('nextHour', {}).get('state') == 'HIGH USAGE' and tot_pred_p > 100.0):
+            active_loads.append(f"Room 2 ({round(r2_p, 1)}W)")
 
         optimizations = []
         if active_loads:
-            optimizations.append(f"Shift flexible loads away from next hour: {', '.join(active_loads)}")
+            optimizations.append(f"Shift flexible loads away from active peak period: {', '.join(active_loads)}")
         else:
-            optimizations.append("Current load profile is optimal. No action needed.")
+            optimizations.append("Current load profile is optimal. No immediate reduction required.")
 
         target_monthly_kwh = 25.0
         current_proj = analytics_dict.get('projectedMonthlyKwh', 0.0) if analytics_dict else 0.0
@@ -531,35 +540,43 @@ class EnergyAnalyticsOptimizer:
         r2_pct = round((r2_units / tot_units) * 100.0, 1) if tot_units > 0 else 50.0
 
         suggestions = []
-        if r1_units >= r2_units:
+
+        # 1. Dynamic Room-Wise Contribution Suggestion
+        if tot_units > 0.1 and (r1_pct >= 65.0 or r2_pct >= 65.0):
+            high_room = "Room 1" if r1_pct >= r2_pct else "Room 2"
+            high_pct = r1_pct if r1_pct >= r2_pct else r2_pct
+            high_units = r1_units if r1_pct >= r2_pct else r2_units
             suggestions.append({
-                "title": "Room 1 is the primary energy contributor",
-                "subtitle": "Inspect Room 1 incandescent lighting/appliances (40W+) during active hours.",
+                "title": f"{high_room} accounts for {int(high_pct)}% of monthly consumption",
+                "subtitle": f"Recorded {round(high_units, 2)} kWh this month. Review appliance usage in {high_room} if reducing total cost.",
                 "icon": "warning"
             })
         else:
             suggestions.append({
-                "title": "Room 2 is the primary energy contributor",
-                "subtitle": "Inspect Room 2 lighting/appliances (10W+) during active hours.",
-                "icon": "warning"
+                "title": "Energy consumption is currently within the expected range",
+                "subtitle": "All monitored rooms are operating efficiently within normal baseline limits.",
+                "icon": "bolt"
             })
-            
-        if summary.get('overallNextHourState') == 'HIGH USAGE':
+
+        # 2. Dynamic Peak / Demand Shifting Suggestion
+        if summary.get('overallNextHourState') == 'HIGH USAGE' and tot_pred_p >= 120.0:
             suggestions.append({
-                "title": "Shift flexible loads away from next hour",
-                "subtitle": "High usage predicted next hour. Defer non-essential equipment.",
+                "title": "Shift flexible loads away from predicted peak period",
+                "subtitle": f"Elevated total demand predicted ({round(tot_pred_p, 1)}W). Defer high-power appliances to off-peak hours.",
                 "icon": "access_time"
             })
         else:
             suggestions.append({
-                "title": "Optimal load profile active",
-                "subtitle": "All rooms operating within normal limits.",
+                "title": "Load distribution is balanced",
+                "subtitle": "No peak-demand surcharge risk detected for the upcoming hour.",
                 "icon": "bolt"
             })
-            
+
+        # 3. General Energy Consumption Quota Suggestion
+        avg_daily = analytics_dict.get('averageDailyUnits', 0.0) if analytics_dict else 0.0
         suggestions.append({
-            "title": "Stay within Gruha Jyothi quota",
-            "subtitle": f"Target daily average under {round(96.0 / 30.0, 1)} units/day.",
+            "title": "Maintain consumption within monthly quota",
+            "subtitle": f"Current daily average is {round(avg_daily, 2)} kWh/day (Target: < 3.2 kWh/day for standard 96-unit allocation).",
             "icon": "energy_savings_leaf"
         })
 
@@ -575,46 +592,78 @@ class EnergyAnalyticsOptimizer:
             "room2Units": r2_units,
             "room1Percent": r1_pct,
             "room2Percent": r2_pct,
-            "peakAlert": summary.get('overallNextHourState') == 'HIGH USAGE'
+            "peakAlert": summary.get('overallNextHourState') == 'HIGH USAGE' and tot_pred_p >= 120.0
         }
 
     def generate_notifications(self, predictions_dict, analytics_dict):
         notifications = []
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        r1_st = predictions_dict.get('room1', {}).get('nextHour', {}).get('state')
-        r2_st = predictions_dict.get('room2', {}).get('nextHour', {}).get('state')
+        r1_p = predictions_dict.get('room1', {}).get('currentPower', 0.0)
+        r2_p = predictions_dict.get('room2', {}).get('currentPower', 0.0)
+        tot_pred_p = predictions_dict.get('summary', {}).get('totalPredictedPower', 0.0)
 
-        if r1_st == "HIGH USAGE":
+        # 1. Genuine Overload Warning (Sensible alert condition)
+        if r1_p >= 180.0:
             notifications.append({
-                "id": f"notif_{int(time.time())}_r1",
-                "title": "Room 1 Peak Load Warning",
-                "subtitle": "Room 1 load is predicted to exceed 40W in the next hour.",
-                "message": "Room 1 load is predicted to exceed 40W in the next hour.",
-                "type": "prediction",
+                "id": "notif_r1_overload",
+                "title": "Room 1 Heavy Load Detected",
+                "subtitle": f"Room 1 power consumption is currently elevated at {round(r1_p, 1)}W.",
+                "message": f"Room 1 power consumption is currently elevated at {round(r1_p, 1)}W.",
+                "type": "warning",
                 "priority": "HIGH",
                 "timestamp": now_str
             })
-        if r2_st == "HIGH USAGE":
+        if r2_p >= 80.0:
             notifications.append({
-                "id": f"notif_{int(time.time())}_r2",
-                "title": "Room 2 Peak Load Warning",
-                "subtitle": "Room 2 load is predicted to exceed 10W in the next hour.",
-                "message": "Room 2 load is predicted to exceed 10W in the next hour.",
-                "type": "prediction",
+                "id": "notif_r2_overload",
+                "title": "Room 2 Heavy Load Detected",
+                "subtitle": f"Room 2 power consumption is currently elevated at {round(r2_p, 1)}W.",
+                "message": f"Room 2 power consumption is currently elevated at {round(r2_p, 1)}W.",
+                "type": "warning",
                 "priority": "HIGH",
                 "timestamp": now_str
             })
+
+        # 2. Predicted Peak Demand Warning (only when predicted demand is genuinely elevated)
+        if tot_pred_p >= 150.0 and predictions_dict.get('summary', {}).get('overallNextHourState') == 'HIGH USAGE':
+            notifications.append({
+                "id": "notif_predicted_peak",
+                "title": "Predicted Peak Load Approaching",
+                "subtitle": f"Total power is forecast to reach {round(tot_pred_p, 1)}W in the next hour. Consider shifting flexible loads.",
+                "message": f"Total power is forecast to reach {round(tot_pred_p, 1)}W in the next hour. Consider shifting flexible loads.",
+                "type": "prediction",
+                "priority": "MEDIUM",
+                "timestamp": now_str
+            })
+
+        # 3. Quota Status Warning (if approaching or exceeding 85% of monthly allocation)
+        if analytics_dict:
+            usage_pct = analytics_dict.get('usagePercentage', 0.0)
+            month_units = analytics_dict.get('monthToDateUnits', 0.0)
+            if usage_pct >= 0.85:
+                notifications.append({
+                    "id": "notif_quota_warning",
+                    "title": "Approaching Energy Quota Limit",
+                    "subtitle": f"Consumed {round(month_units, 1)} units ({round(usage_pct * 100, 1)}% of monthly allocation).",
+                    "message": f"Consumed {round(month_units, 1)} units ({round(usage_pct * 100, 1)}% of monthly allocation).",
+                    "type": "warning",
+                    "priority": "HIGH",
+                    "timestamp": now_str
+                })
+
+        # 4. Default Optimal Status when everything is within expected limits
         if not notifications:
             notifications.append({
-                "id": f"notif_{int(time.time())}_ok",
+                "id": "notif_optimal",
                 "title": "Energy Usage Optimal",
-                "subtitle": "All rooms are operating within normal baseline limits.",
-                "message": "All rooms are operating within normal baseline limits.",
+                "subtitle": "All monitored rooms are operating within normal baseline limits.",
+                "message": "All monitored rooms are operating within normal baseline limits.",
                 "type": "optimal",
                 "priority": "LOW",
                 "timestamp": now_str
             })
+
         return {
             "timestamp": now_str,
             "items": notifications
