@@ -28,6 +28,7 @@ ANALYTICS_PATH = "/sensor_logs/esp32_01/analytics/latest"
 OPTIMIZATION_PATH = "/sensor_logs/esp32_01/optimization/latest"
 NOTIFICATIONS_PATH = "/sensor_logs/esp32_01/notifications/latest"
 ALERTS_PATH = "/sensor_logs/esp32_01/alerts/latest"
+SETTINGS_PATH = "/sensor_logs/esp32_01/settings"
 
 # 23 Baseline / Production Features matching trained Random Forest models
 FEATURE_COLS = [
@@ -380,8 +381,15 @@ class EnergyMLInferenceEngine:
 # 3. ENERGY ANALYTICS & OPTIMIZATION MODULE
 # -------------------------------------------------------------------------
 class EnergyAnalyticsOptimizer:
-    def __init__(self, cost_per_kwh=8.0):
+    def __init__(self, cost_per_kwh=7.0, allocated_units=96.0):
         self.cost_per_kwh = cost_per_kwh
+        self.allocated_units = allocated_units
+
+    def update_settings(self, cost_per_kwh=None, allocated_units=None):
+        if cost_per_kwh is not None:
+            self.cost_per_kwh = float(cost_per_kwh)
+        if allocated_units is not None:
+            self.allocated_units = float(allocated_units)
 
     @staticmethod
     def _compute_delta_reset_safe(df, col):
@@ -394,9 +402,12 @@ class EnergyAnalyticsOptimizer:
         pos_diffs = np.where(diffs >= 0, diffs, vals[1:])
         return float(np.sum(pos_diffs))
 
-    def compute_historical_analytics(self, readings_df):
+    def compute_historical_analytics(self, readings_df, allocated_units=None, tariff_rate=None):
         if readings_df is None or len(readings_df) == 0:
             return None
+
+        alloc = float(allocated_units) if allocated_units is not None else float(self.allocated_units)
+        cost_rate = float(tariff_rate) if tariff_rate is not None else float(self.cost_per_kwh)
 
         df = readings_df.copy()
         if 'timestamp' in df.columns:
@@ -472,28 +483,28 @@ class EnergyAnalyticsOptimizer:
         days_in_month = 30
         daily_avg = e_month / elapsed_days if e_month > 0 else (e_day if e_day > 0 else 0.5)
         projected_monthly_kwh = round(daily_avg * days_in_month, 2)
-        projected_cost = round(projected_monthly_kwh * self.cost_per_kwh, 2)
+        projected_cost = round(projected_monthly_kwh * cost_rate, 2)
 
         return {
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "dailyKwh": round(e_day, 3),
             "todayUnits": round(e_day, 3),
-            "dailyCost": round(e_day * self.cost_per_kwh, 2),
+            "dailyCost": round(e_day * cost_rate, 2),
             "weeklyKwh": round(e_week, 3),
             "weekUnits": round(e_week, 3),
             "weeklyTotalUnits": round(e_week, 3),
-            "weeklyCost": round(e_week * self.cost_per_kwh, 2),
+            "weeklyCost": round(e_week * cost_rate, 2),
             "monthlyKwh": round(e_month, 3),
             "monthToDateUnits": round(e_month, 3),
-            "monthlyCost": round(e_month * self.cost_per_kwh, 2),
+            "monthlyCost": round(e_month * cost_rate, 2),
             "projectedMonthlyKwh": projected_monthly_kwh,
             "projectedMonthEndUnits": projected_monthly_kwh,
             "projectedMonthlyCost": projected_cost,
             "averageDailyUnits": round(daily_avg, 3),
-            "allocatedUnits": 96.0,
-            "remainingUnits": round(max(0.0, 96.0 - e_month), 3),
-            "projectedExcessUnits": round(max(0.0, projected_monthly_kwh - 96.0), 3),
-            "usagePercentage": round(e_month / 96.0, 4),
+            "allocatedUnits": round(alloc, 1),
+            "remainingUnits": round(max(0.0, alloc - e_month), 3),
+            "projectedExcessUnits": round(max(0.0, projected_monthly_kwh - alloc), 3),
+            "usagePercentage": round(e_month / alloc, 4) if alloc > 0 else 0.0,
             "daysElapsed": elapsed_days,
             "daysInMonth": days_in_month,
             "dailyBars": daily_bars,
@@ -503,9 +514,12 @@ class EnergyAnalyticsOptimizer:
             "room2MonthUnits": round(r2_month_e, 3)
         }
 
-    def generate_optimization_advisories(self, predictions_dict, analytics_dict):
+    def generate_optimization_advisories(self, predictions_dict, analytics_dict, allocated_units=None, tariff_rate=None):
         if not predictions_dict:
             return None
+
+        alloc = float(allocated_units) if allocated_units is not None else float(self.allocated_units)
+        cost_rate = float(tariff_rate) if tariff_rate is not None else float(self.cost_per_kwh)
 
         r1 = predictions_dict.get('room1', {})
         r2 = predictions_dict.get('room2', {})
@@ -528,10 +542,10 @@ class EnergyAnalyticsOptimizer:
         else:
             optimizations.append("Current load profile is optimal. No immediate reduction required.")
 
-        target_monthly_kwh = 25.0
+        target_monthly_kwh = min(25.0, alloc * 0.8)
         current_proj = analytics_dict.get('projectedMonthlyKwh', 0.0) if analytics_dict else 0.0
         savings_kwh = max(0.0, current_proj - target_monthly_kwh)
-        savings_cost = round(savings_kwh * self.cost_per_kwh, 2)
+        savings_cost = round(savings_kwh * cost_rate, 2)
 
         r1_units = analytics_dict.get('room1MonthUnits', 0.0) if analytics_dict else 0.0
         r2_units = analytics_dict.get('room2MonthUnits', 0.0) if analytics_dict else 0.0
@@ -574,9 +588,10 @@ class EnergyAnalyticsOptimizer:
 
         # 3. General Energy Consumption Quota Suggestion
         avg_daily = analytics_dict.get('averageDailyUnits', 0.0) if analytics_dict else 0.0
+        target_daily = round(alloc / 30.0, 1)
         suggestions.append({
             "title": "Maintain consumption within monthly quota",
-            "subtitle": f"Current daily average is {round(avg_daily, 2)} kWh/day (Target: < 3.2 kWh/day for standard 96-unit allocation).",
+            "subtitle": f"Current daily average is {round(avg_daily, 2)} kWh/day (Target: < {target_daily} kWh/day for {int(alloc) if alloc.is_integer() else alloc}-unit allocation).",
             "icon": "energy_savings_leaf"
         })
 
@@ -595,15 +610,16 @@ class EnergyAnalyticsOptimizer:
             "peakAlert": summary.get('overallNextHourState') == 'HIGH USAGE' and tot_pred_p >= 120.0
         }
 
-    def generate_notifications(self, predictions_dict, analytics_dict):
+    def generate_notifications(self, predictions_dict, analytics_dict, allocated_units=None):
         notifications = []
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        alloc = float(allocated_units) if allocated_units is not None else float(self.allocated_units)
 
         r1_p = predictions_dict.get('room1', {}).get('currentPower', 0.0)
         r2_p = predictions_dict.get('room2', {}).get('currentPower', 0.0)
         tot_pred_p = predictions_dict.get('summary', {}).get('totalPredictedPower', 0.0)
 
-        # 1. Genuine Overload Warning (Sensible alert condition)
+        # 1. Genuine Overload Warning
         if r1_p >= 180.0:
             notifications.append({
                 "id": "notif_r1_overload",
@@ -625,7 +641,7 @@ class EnergyAnalyticsOptimizer:
                 "timestamp": now_str
             })
 
-        # 2. Predicted Peak Demand Warning (only when predicted demand is genuinely elevated)
+        # 2. Predicted Peak Demand Warning
         if tot_pred_p >= 150.0 and predictions_dict.get('summary', {}).get('overallNextHourState') == 'HIGH USAGE':
             notifications.append({
                 "id": "notif_predicted_peak",
@@ -641,12 +657,13 @@ class EnergyAnalyticsOptimizer:
         if analytics_dict:
             usage_pct = analytics_dict.get('usagePercentage', 0.0)
             month_units = analytics_dict.get('monthToDateUnits', 0.0)
+            alloc_val = analytics_dict.get('allocatedUnits', alloc)
             if usage_pct >= 0.85:
                 notifications.append({
                     "id": "notif_quota_warning",
                     "title": "Approaching Energy Quota Limit",
-                    "subtitle": f"Consumed {round(month_units, 1)} units ({round(usage_pct * 100, 1)}% of monthly allocation).",
-                    "message": f"Consumed {round(month_units, 1)} units ({round(usage_pct * 100, 1)}% of monthly allocation).",
+                    "subtitle": f"Consumed {round(month_units, 1)} of {int(alloc_val) if isinstance(alloc_val, (int, float)) and float(alloc_val).is_integer() else alloc_val} units ({round(usage_pct * 100, 1)}% of monthly allocation).",
+                    "message": f"Consumed {round(month_units, 1)} of {int(alloc_val) if isinstance(alloc_val, (int, float)) and float(alloc_val).is_integer() else alloc_val} units ({round(usage_pct * 100, 1)}% of monthly allocation).",
                     "type": "warning",
                     "priority": "HIGH",
                     "timestamp": now_str
@@ -753,13 +770,31 @@ class VoltixProductionBridge:
             print(f"[{now_time}] [*] Telemetry unchanged ({latest_ts}). Firebase contains no newer readings. Waiting for next ESP32 update...")
             return False, latest_ts
 
+        # Fetch current dynamic settings from Firebase
+        allocated_units = 96.0
+        tariff_rate = 7.0
+        if not self.mock_data_path:
+            settings_data = self.fb.get(SETTINGS_PATH)
+            if settings_data and isinstance(settings_data, dict):
+                if 'quotaUnits' in settings_data:
+                    try:
+                        allocated_units = float(settings_data['quotaUnits'])
+                    except (ValueError, TypeError):
+                        pass
+                if 'tariffRate' in settings_data:
+                    try:
+                        tariff_rate = float(settings_data['tariffRate'])
+                    except (ValueError, TypeError):
+                        pass
+            self.analytics.update_settings(cost_per_kwh=tariff_rate, allocated_units=allocated_units)
+
         # ML Inference
         preds = self.engine.predict(latest_reading, df)
-        analytics_res = self.analytics.compute_historical_analytics(df)
-        opt_res = self.analytics.generate_optimization_advisories(preds, analytics_res)
-        notif_res = self.analytics.generate_notifications(preds, analytics_res)
+        analytics_res = self.analytics.compute_historical_analytics(df, allocated_units=allocated_units, tariff_rate=tariff_rate)
+        opt_res = self.analytics.generate_optimization_advisories(preds, analytics_res, allocated_units=allocated_units, tariff_rate=tariff_rate)
+        notif_res = self.analytics.generate_notifications(preds, analytics_res, allocated_units=allocated_units)
         
-        print(f"\n[{now_time}] [*] Telemetry Updated (Timestamp: {preds['timestamp']}, Window: {len(df)} readings)")
+        print(f"\n[{now_time}] [*] Telemetry Updated (Timestamp: {preds['timestamp']}, Window: {len(df)} readings, Quota: {allocated_units}U @ Rs {tariff_rate}/kWh)")
         print(f"  Room 1 (Measured: {preds['room1']['currentPower']}W -> Predicted: {preds['room1']['predictedPower']}W) | Next Hour: {preds['room1']['nextHour']['state']} ({preds['room1']['nextHour']['confidencePercent']}%) | Tomorrow: {preds['room1']['tomorrow']['state']}")
         print(f"  Room 2 (Measured: {preds['room2']['currentPower']}W -> Predicted: {preds['room2']['predictedPower']}W) | Next Hour: {preds['room2']['nextHour']['state']} ({preds['room2']['nextHour']['confidencePercent']}%) | Tomorrow: {preds['room2']['tomorrow']['state']}")
         print(f"  Total Load: {preds['summary']['totalCurrentPower']}W -> Predicted: {preds['summary']['totalPredictedPower']}W | Overall: {preds['summary']['overallNextHourState']}")
